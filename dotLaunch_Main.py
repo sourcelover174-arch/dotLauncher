@@ -2391,6 +2391,16 @@ class DotLauncher(QMainWindow):
         self.delete_button.clicked.connect(self.delete_instance)
         left_layout.addWidget(self.delete_button)
 
+        self.delete_button = QPushButton("Удалить сборку")
+        self.delete_button.clicked.connect(self.delete_instance)
+        left_layout.addWidget(self.delete_button)
+
+        self.open_folder_button = QPushButton("Открыть папку сборки")
+        self.open_folder_button.clicked.connect(self.open_instance_folder)
+        left_layout.addWidget(self.open_folder_button)
+
+        self.modrinth_button = QPushButton("Скачать из Modrinth")
+        
         self.modrinth_button = QPushButton("Скачать из Modrinth")
         self.modrinth_button.clicked.connect(self.open_modrinth_window)
         left_layout.addWidget(self.modrinth_button)
@@ -3124,6 +3134,36 @@ class DotLauncher(QMainWindow):
         self.mods_list.clear()
         self.log(f"[dotLauncher] Сборка «{inst['name']}» удалена.")
 
+    def open_instance_folder(self):
+        if not self.current_instance:
+            QMessageBox.information(
+                self, "Нет сборки",
+                "Сначала выберите сборку в списке слева."
+            )
+            return
+
+        inst = self.instances[self.current_instance]
+        path = self._instance_abs_path(inst)
+
+        if not os.path.isdir(path):
+            QMessageBox.warning(
+                self, "Папка не найдена",
+                f"Папка сборки не существует:\n{path}"
+            )
+            return
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Ошибка",
+                f"Не удалось открыть папку:\n{e}"
+            )
     # ---------- MODRINTH ----------
     def open_modrinth_window(self):
         if not self.current_instance:
