@@ -39,7 +39,7 @@
 
 ## Скриншоты
 - Интерфейс лаунчера
-<img width="1021" height="719" alt="image" src="https://github.com/user-attachments/assets/0a275421-a775-4e48-be28-600ed31e5b8e" />
+<img width="1000" height="715" alt="image" src="https://github.com/user-attachments/assets/d3ff4d14-f6e0-4a71-8b46-55c44d0ca6e3" />
 
 - Скачивание через Modrinth
 <img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/dcc7b024-f8a6-4ebe-b591-9adc6f9f5464" />
