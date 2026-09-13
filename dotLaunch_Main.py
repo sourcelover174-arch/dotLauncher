@@ -2391,10 +2391,6 @@ class DotLauncher(QMainWindow):
         self.delete_button.clicked.connect(self.delete_instance)
         left_layout.addWidget(self.delete_button)
 
-        self.delete_button = QPushButton("Удалить сборку")
-        self.delete_button.clicked.connect(self.delete_instance)
-        left_layout.addWidget(self.delete_button)
-
         self.open_folder_button = QPushButton("Открыть папку сборки")
         self.open_folder_button.clicked.connect(self.open_instance_folder)
         left_layout.addWidget(self.open_folder_button)
