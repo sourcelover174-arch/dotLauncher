@@ -48,7 +48,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QStandardPaths,
-    QPoint, QBuffer, QIODevice,
+    QPoint, QBuffer, QIODevice, QTimer,
 )
 from PyQt6.QtGui import (
     QFont, QPalette, QColor, QDragEnterEvent, QDropEvent,
@@ -2276,7 +2276,7 @@ class ModsListWidget(QListWidget):
         item = self.itemAt(event.pos())
         super().mousePressEvent(event)
         if item is not None:
-            self.modClicked.emit(item)
+            QTimer.singleShot(0, lambda it=item: self.modClicked.emit(it))
 
 
 # ============================================================
@@ -3018,6 +3018,10 @@ class DotLauncher(QMainWindow):
         else:
             text = filename
 
+        if disabled:
+        # Пометка прямо в тексте — она видна всегда, независимо от QSS.
+        text = f"[ ВЫКЛЮЧЕН ]  {text}"
+
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, {
             "filename": filename,
@@ -3028,9 +3032,12 @@ class DotLauncher(QMainWindow):
         )
 
         if disabled:
-            # Визуально «более серый» фон для выключенных модов
-            item.setForeground(QColor("#707070"))
-            item.setBackground(QColor("#d8d8d8"))
+        # Курсив + серый текст. Даже если QSS перебьёт цвет,
+        # курсив и текстовый префикс останутся видны.
+            f = item.font()
+            f.setItalic(True)
+            item.setFont(f)
+            item.setForeground(QColor("#808080"))
 
         self.mods_list.addItem(item)
 
