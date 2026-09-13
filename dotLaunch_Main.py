@@ -228,11 +228,6 @@ _ICON_CACHE = {}
 
 
 def _win98_icon(kind, w, h, bg="#c0c0c0"):
-    """
-    Рисует маленькую пиксельную иконку в стиле Win98 и возвращает
-    её как `url(data:image/png;base64,...)` для использования в QSS.
-    Результат кэшируется по ключу (kind, w, h, bg).
-    """
     key = (kind, w, h, bg)
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
@@ -287,7 +282,6 @@ def _win98_icon(kind, w, h, bg="#c0c0c0"):
 
 
 def build_win98_qss():
-    """Собирает финальный QSS, подставляя сгенерированные base64-иконки."""
     icons = {
         "ICON_DOWN":   _win98_icon("down",   7, 4, bg="#c0c0c0"),
         "ICON_UP":     _win98_icon("up",     7, 4, bg="#c0c0c0"),
@@ -337,7 +331,6 @@ QSplitter::handle:hover {
     background-color: #808080;
 }
 
-/* Кнопки: классические выпуклые с двухцветной рамкой */
 QPushButton {
     background-color: #c0c0c0;
     color: #000000;
@@ -362,7 +355,6 @@ QPushButton:disabled {
     color: #808080;
 }
 
-/* Поля ввода: утопленные */
 QLineEdit {
     background-color: #ffffff;
     color: #000000;
@@ -376,7 +368,6 @@ QLineEdit {
     selection-color: #ffffff;
 }
 
-/* Спинбокс: чуть больше отступ справа под кнопки */
 QSpinBox {
     background-color: #ffffff;
     color: #000000;
@@ -422,7 +413,6 @@ QSpinBox::down-arrow {
     height: 4px;
 }
 
-/* Комбобокс */
 QComboBox {
     background-color: #ffffff;
     color: #000000;
@@ -456,7 +446,6 @@ QComboBox QAbstractItemView {
     selection-color: #ffffff;
 }
 
-/* Списки */
 QListWidget {
     background-color: #ffffff;
     color: #000000;
@@ -476,7 +465,6 @@ QListWidget::item:selected {
     color: #ffffff;
 }
 
-/* Многострочный текст (консоль, лог) */
 QTextEdit {
     background-color: #ffffff;
     color: #000000;
@@ -490,7 +478,6 @@ QTextEdit {
     selection-color: #ffffff;
 }
 
-/* Чекбоксы: при checked — синяя заливка, как в Win98 */
 QCheckBox {
     color: #000000;
     spacing: 6px;
@@ -519,7 +506,6 @@ QCheckBox::indicator:checked:disabled {
     background-color: #808080;
 }
 
-/* Прогресс-бар */
 QProgressBar {
     background-color: #c0c0c0;
     color: #000000;
@@ -534,7 +520,6 @@ QProgressBar::chunk {
     background-color: #000080;
 }
 
-/* Скроллбары */
 QScrollBar:vertical {
     background-color: #c0c0c0;
     width: 16px;
@@ -631,13 +616,11 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background-color: #c0c0c0;
 }
 
-/* Скролл-область */
 QScrollArea {
     background-color: #c0c0c0;
     border: none;
 }
 
-/* Строка состояния */
 QStatusBar {
     background-color: #c0c0c0;
     color: #000000;
@@ -651,7 +634,6 @@ QStatusBar QLabel {
     border: none;
 }
 
-/* Меню и подсказки */
 QMenu {
     background-color: #c0c0c0;
     color: #000000;
@@ -905,9 +887,6 @@ def parse_toml_mod_info(content, loader):
                 ver_range = dep.get("versionRange", "")
                 mc_vers = parse_version_range(ver_range)
                 if mc_vers:
-                    # Для Forge и NeoForge возвращаем None, чтобы лаунчер
-                    # сам подобрал актуальную версию загрузчика.
-                    # Это исправляет баг 2 и баг 3.
                     return {
                         "loader": loader,
                         "mc_versions": mc_vers,
@@ -952,15 +931,10 @@ def read_mod_info(jar_path):
 
 
 def read_mod_display_name(jar_path):
-    """
-    Пытается получить человекочитаемое имя мода из его метаданных.
-    Возвращает строку или None, если имя извлечь не удалось.
-    """
     try:
         with zipfile.ZipFile(jar_path, "r") as zf:
             namelist = zf.namelist()
 
-            # Fabric
             if "fabric.mod.json" in namelist:
                 try:
                     with zf.open("fabric.mod.json") as fm:
@@ -972,7 +946,6 @@ def read_mod_display_name(jar_path):
                 except Exception:
                     pass
 
-            # Forge
             if "META-INF/mods.toml" in namelist and tomllib is not None:
                 try:
                     with zf.open("META-INF/mods.toml") as fm:
@@ -991,7 +964,6 @@ def read_mod_display_name(jar_path):
                 except Exception:
                     pass
 
-            # NeoForge
             if "META-INF/neoforge.mods.toml" in namelist and tomllib is not None:
                 try:
                     with zf.open("META-INF/neoforge.mods.toml") as fm:
@@ -1264,17 +1236,6 @@ class LauncherThread(QThread):
                 f"[dotLauncher] Версия {loader_name}: {loader_version}"
             )
 
-            # ---- ИСПРАВЛЕНИЕ БАГА 1 ----
-            # Правильные имена параметров для разных загрузчиков.
-            if self.loader_id == "fabric":
-                install_kwargs = {"loader_version": loader_version}
-            elif self.loader_id == "forge":
-                install_kwargs = {"forge_version": loader_version}
-            elif self.loader_id == "neoforge":
-                install_kwargs = {"neoforge_version": loader_version}
-            else:
-                install_kwargs = {"loader_version": loader_version}
-
             mod_loader.install(
                 self.version,
                 minecraft_dir,
@@ -1282,7 +1243,6 @@ class LauncherThread(QThread):
                 callback=callback,
                 java=effective_java,
             )
-            # ---- КОНЕЦ ИСПРАВЛЕНИЯ БАГА 1 ----
 
             if self._stop:
                 self.finished_signal.emit(False, "Отменено пользователем")
@@ -1589,8 +1549,6 @@ class ModpackImportThread(QThread):
         mods_dir = os.path.join(minecraft_dir, "mods")
         os.makedirs(mods_dir, exist_ok=True)
 
-        # ---- ИСПРАВЛЕНИЕ БАГА 4 ----
-        # Фильтруем моды по выбранному загрузчику и версии Minecraft.
         filtered_mods = []
         for jar, info in mods_info:
             if info["loader"] != loader:
@@ -1612,10 +1570,9 @@ class ModpackImportThread(QThread):
             self.log_signal.emit(
                 "[Внимание] После фильтрации не осталось подходящих модов."
             )
-        # ---- КОНЕЦ ИСПРАВЛЕНИЯ БАГА 4 ----
 
         copied_names = set()
-        for jar, _ in filtered_mods:   # используем отфильтрованный список
+        for jar, _ in filtered_mods:
             base = os.path.basename(jar)
             target_name = base
             if target_name in copied_names:
@@ -2052,11 +2009,8 @@ class ModrinthWindow(QDialog):
         if self.search_thread and self.search_thread.isRunning():
             return
 
-        # ---- ИСПРАВЛЕНИЕ БАГА 7 ----
-        # Сбрасываем выбранные моды при новом поиске.
         self.chosen.clear()
         self._update_chosen_label()
-        # ---- КОНЕЦ ИСПРАВЛЕНИЯ БАГА 7 ----
 
         self.search_status.setText("Поиск...")
         self._clear_results()
@@ -2267,16 +2221,21 @@ class DropZone(QLabel):
 # ============================================================
 class ModsListWidget(QListWidget):
     """
-    QListWidget, который испускает сигнал modClicked при клике
-    ЛЮБОЙ кнопкой мыши по элементу списка.
+    QListWidget, который испускает сигнал modRowClicked с номером строки
+    при клике ЛЮБОЙ кнопкой мыши по элементу списка.
     """
-    modClicked = pyqtSignal(QListWidgetItem)
+    modRowClicked = pyqtSignal(int)
 
     def mousePressEvent(self, event):
-        item = self.itemAt(event.pos())
         super().mousePressEvent(event)
-        if item is not None:
-            QTimer.singleShot(0, lambda it=item: self.modClicked.emit(it))
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            row = index.row()
+            QTimer.singleShot(0, lambda r=row: self._emit_row(r))
+
+    def _emit_row(self, row):
+        if 0 <= row < self.count():
+            self.modRowClicked.emit(row)
 
 
 # ============================================================
@@ -2425,7 +2384,7 @@ class DotLauncher(QMainWindow):
         self.mods_list = ModsListWidget()
         self.mods_list.setVisible(False)
         self.mods_list.setMinimumHeight(120)
-        self.mods_list.modClicked.connect(self.on_mod_clicked)
+        self.mods_list.modRowClicked.connect(self.on_mod_row_clicked)
         left_layout.addWidget(self.mods_list, 2)
 
         self.delete_button = QPushButton("Удалить сборку")
@@ -2919,7 +2878,6 @@ class DotLauncher(QMainWindow):
                     self.instance_list.setCurrentItem(item)
                     break
 
-        # Обновляем состояние кнопки разворота
         self.expand_button.setEnabled(bool(self.current_instance))
 
     def on_instance_selected(self, item):
@@ -2940,7 +2898,6 @@ class DotLauncher(QMainWindow):
 
             self.expand_button.setEnabled(True)
 
-            # Если список модов развёрнут — перезаполним его
             if self.mods_expanded:
                 self._populate_mods_list()
 
@@ -2959,7 +2916,12 @@ class DotLauncher(QMainWindow):
             self.mods_list.clear()
 
     def _populate_mods_list(self):
+        """
+        Полная пересборка списка модов. Вызывается при развороте сборки
+        и при смене выбранной сборки. При клике по моду НЕ вызывается.
+        """
         self.mods_list.clear()
+
         if not self.current_instance or self.current_instance not in self.instances:
             return
 
@@ -2969,37 +2931,38 @@ class DotLauncher(QMainWindow):
         mods_dir = os.path.join(minecraft_dir, "mods")
         disabled_dir = os.path.join(minecraft_dir, "disabledMods")
 
-        # Включённые моды
+        entries = []
         if os.path.isdir(mods_dir):
             try:
-                enabled = sorted(
-                    f for f in os.listdir(mods_dir)
-                    if f.lower().endswith(".jar")
-                )
+                for f in os.listdir(mods_dir):
+                    if f.lower().endswith(".jar"):
+                        entries.append((f, False))
             except OSError:
-                enabled = []
-            for fn in enabled:
-                self._add_mod_item(fn, disabled=False)
-
-        # Выключенные моды
+                pass
         if os.path.isdir(disabled_dir):
             try:
-                disabled = sorted(
-                    f for f in os.listdir(disabled_dir)
-                    if f.lower().endswith(".jar")
-                )
+                for f in os.listdir(disabled_dir):
+                    if f.lower().endswith(".jar"):
+                        entries.append((f, True))
             except OSError:
-                disabled = []
-            for fn in disabled:
-                self._add_mod_item(fn, disabled=True)
+                pass
 
-        if self.mods_list.count() == 0:
+        entries.sort(key=lambda e: (e[1], e[0].lower()))
+
+        for fn, is_disabled in entries:
+            self._add_mod_item(fn, is_disabled)
+
+        if not entries:
             placeholder = QListWidgetItem("— нет модов —")
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
-            placeholder.setForeground(QColor("#808080"))
             self.mods_list.addItem(placeholder)
 
-    def _add_mod_item(self, filename, disabled):
+    def _make_mod_item(self, filename, disabled):
+        """
+        Создаёт QListWidgetItem с текстом и состоянием, но НЕ добавляет
+        его в список. Используется и при полной пересборке, и при
+        обновлении in place.
+        """
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
@@ -3019,8 +2982,7 @@ class DotLauncher(QMainWindow):
             text = filename
 
         if disabled:
-        # Пометка прямо в тексте — она видна всегда, независимо от QSS.
-        text = f"[ ВЫКЛЮЧЕН ]  {text}"
+            text = f"[ВЫКЛ]  {text}"
 
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, {
@@ -3031,18 +2993,30 @@ class DotLauncher(QMainWindow):
             "Клик — " + ("включить" if disabled else "выключить") + " мод"
         )
 
+        f = item.font()
+        f.setItalic(disabled)
+        item.setFont(f)
         if disabled:
-        # Курсив + серый текст. Даже если QSS перебьёт цвет,
-        # курсив и текстовый префикс останутся видны.
-            f = item.font()
-            f.setItalic(True)
-            item.setFont(f)
             item.setForeground(QColor("#808080"))
 
+        return item
+
+    def _add_mod_item(self, filename, disabled):
+        item = self._make_mod_item(filename, disabled)
         self.mods_list.addItem(item)
 
-    def on_mod_clicked(self, item):
+    def on_mod_row_clicked(self, row):
+        """
+        Клик по моду. Вместо пересборки всего списка (из-за чего Qt
+        терял элементы) обновляем ТОЛЬКО кликнутый item in place.
+        """
         if not self.current_instance or self.current_instance not in self.instances:
+            return
+        if row < 0 or row >= self.mods_list.count():
+            return
+
+        item = self.mods_list.item(row)
+        if item is None:
             return
         data = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(data, dict):
@@ -3065,14 +3039,12 @@ class DotLauncher(QMainWindow):
 
         if not os.path.isfile(src):
             self.log(f"[Внимание] Файл мода не найден: {src}")
-            self._populate_mods_list()
             return
 
         try:
             os.makedirs(dst_dir, exist_ok=True)
             target_name = filename
             target = os.path.join(dst_dir, target_name)
-            # На случай конфликта имён
             if os.path.exists(target):
                 base, ext = os.path.splitext(filename)
                 i = 1
@@ -3087,8 +3059,19 @@ class DotLauncher(QMainWindow):
             self.log(f"[Ошибка] Не удалось переключить мод {filename}: {e}")
             return
 
-        # Перерисуем список, чтобы отразить новое состояние
-        self._populate_mods_list()
+        # Обновляем ИМЕННО ЭТОТ item — без clear(), без пересборки списка.
+        new_disabled = not disabled
+        new_item = self._make_mod_item(target_name, new_disabled)
+        item.setText(new_item.text())
+        item.setData(Qt.ItemDataRole.UserRole, new_item.data(Qt.ItemDataRole.UserRole))
+        item.setToolTip(new_item.toolTip())
+        item.setFont(new_item.font())
+        if new_disabled:
+            item.setForeground(QColor("#808080"))
+        else:
+            item.setForeground(QColor("#000000"))
+
+        self.mods_list.update()
 
     def delete_instance(self):
         if not self.current_instance:
@@ -3170,7 +3153,6 @@ class DotLauncher(QMainWindow):
         window.exec()
         self.log(f"[dotLauncher] Modrinth: окно закрыто для «{inst['name']}».")
 
-        # Обновим список модов, если он развёрнут
         if self.mods_expanded:
             self._populate_mods_list()
 
@@ -3194,16 +3176,11 @@ class DotLauncher(QMainWindow):
             token = "0" * 32
             elyby = False
         else:
-            # ---- ИСПРАВЛЕНИЕ БАГА 12 ----
-            # Перед запуском принудительно обновляем токен Ely.by,
-            # чтобы игра не запустилась с просроченной сессией.
             if self.config.get("elyby_refresh_token"):
                 self.log("[dotLauncher] Обновление сессии Ely.by перед запуском...")
                 self._try_refresh_elyby()
-                # Ждём завершения обновления (с таймаутом, чтобы не зависнуть навсегда)
                 if self.refresh_thread and self.refresh_thread.isRunning():
                     self.refresh_thread.wait(15000)
-            # ---- КОНЕЦ ИСПРАВЛЕНИЯ БАГА 12 ----
 
             username = self.config.get("elyby_username", "")
             uuid_val = self.config.get("elyby_uuid", "")
