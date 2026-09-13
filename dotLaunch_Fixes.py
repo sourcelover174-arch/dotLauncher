@@ -20,6 +20,7 @@ import threading
 import logging
 import traceback
 import socket
+import base64
 
 _orig_getaddrinfo = socket.getaddrinfo
 def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -51,7 +52,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QFont, QPalette, QColor, QDragEnterEvent, QDropEvent,
-    QPixmap, QPainter, QPolygon, QPen,
+    QPixmap, QPainter, QPolygon, QPen, QIcon,
 )
 
 import minecraft_launcher_lib
@@ -101,6 +102,120 @@ SKIP_DIRS = {
     "saves", "logs", "crash-reports",
     "versions", "libraries", "assets", "screenshots",
 }
+
+APP_ICON_B64 = (     
+    "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXA"
+    "vmHAAALiUlEQVR4AdRZa4xV1RX+1jlz77yY9wMURn"
+    "AUEVEoIwIzaDvDvAFtrY0toqURfCDoH2JtmyYmklp"
+    "Di8RXxPqYgfpIbSpBEkxji2JF0yY1bU1rq1YiUMbA"
+    "MMPMMMx9nHtOv7XPOZc7PAaEMYQ9Z+2119qPtb611"
+    "97n3jvWli1bvM2bz09S3y3XBW688cPzktR3C+ewbN"
+    "tWg/fem29I2+rK9deXY+fOBqPTvtWrq1SNPXuWor/"
+    "/PkNdXcuMTqtzCqCgoAC1tbWGtK0OKc2ePdvotE9l"
+    "pby8POgYpfz8fFUZOqcAjAdnWZ1TAH19fdixY4chb"
+    "YdYdu7caXTaF+r6+/vR09NjKHPsOQWwaNHfUF//ri"
+    "Ftq7Nbt3YbOdSvW7dH1bj44pdQVva0oaqqjUanlWU"
+    "Rgh6g85HUd0tE0N7ePurU2taKefPnkOZC21+FDREB"
+    "449RLwPxXvTHD8Izfy76Ez0YSPTC87xRtzWqAGLOI"
+    "Hpj++F4SeO657mGg3XKc9CX6MbhRN+oghgVAI6bxK"
+    "H4AcRSRyAihiyxyS1QIlkm+h53IOnGDcghgh0NJNb"
+    "ZLOIxwgNMl8Fkv3FSnQ3X86DRV/IYfxci7M2gOMEq"
+    "6EQqFk45I37GAAYT/eiL9yDlpYxhBeMSkMcoGwUrb"
+    "XtpHQHwyElAYBG2dSf6eF50F3EG5UsDiDlDJgUSTI"
+    "VMeyLhUpmOihkiotzjTviH2OPuaIdHjc9dHE4eYkA"
+    "Owg0CovrTodDqKcemXId53o0hZyAYS2dEKRDJRAR8"
+    "2PIfISg9C77Eo8zd0B3jLKMSUwPCP7B4BKa70c8d8"
+    "TiWqlM+pwTgMSX6mSoDyV4u5kFEyJHmdItx1Fx3ER"
+    "aPxpVCWSCm6ZmaM7im3/T1YL9LnUcCi4Ls57WraUp"
+    "xxGdEADHnCKN+gHnumFtEVwqNGB56pB0Bqd4jJCWX"
+    "6eAxqh5l7eZbk64CylX22KdcHVYeLifcOZUdXscHB"
+    "/Zr86Q0MoBEDENx3hICiLACAi50IrwmLQj/EBQRSh"
+    "kUqA3zggiHXGBBi80r16LTogLJ4w46joPeg/1wnKM"
+    "7y67jHn+F49S+onrCpZhYXm3i56SYJgyRZ5xg7Ex0"
+    "lbvcIZeHzzO7JAQjdCwkZMgWHTX9BAgWz+yAx/XVS"
+    "Q8iQi2QjLtY1PxNXDy+2sgjVSMC0Ci4rpeen+J3OD"
+    "WVVtC02vTN+lqX0fNIKnnDHFQN6KQFIUCwiOESyGI"
+    "cTwzRAk1ecOEF0OI4SWUnJeukPexQAOqgF/cgKSqC"
+    "hyYAbjmCopHVNABdgRbhQTXOq8A2d83VHUsD80yHD"
+    "xBIMU0SQw7clK8XGrBhmzGxIaawaZ24sk6s9rWplL"
+    "6k6A1FOw7YXOvP7/0F99/3Q3Q82wmHBnWDXn3lt1h"
+    "6y+0QEUO7P9+DG1q/bVJqzYMP49LxlyOZSOJ7Ny1B"
+    "3dXX4WB3N1ckMDqajDl4bN0TaK5vwaO/WI9UyoEw6"
+    "LEYjXGUQtq+fTvWrl1rvsxQNewZEYDHyIkIrJRAy7"
+    "QrZ2Jh4/V0fiNW33s/KseMY+67+PH9P8WW117nEDU"
+    "HrHtkPf60410M0Ym3/vA2DffigpKL8Pttb+Jf//wI"
+    "V11Wg2QshVTCxXduvBkPPbgG//j7h1j787WoGjuR6"
+    "xAcbWujdlYdGhsb8cADD/DLTBlcprHqQ7LCxol4Go"
+    "Bn4Vs33Yyuri60LmjBpt90orik2ERYx/Qd6kNWVhb"
+    "ijLJLw/v+t88sd+TwIMIv4Gp4/ZO/xIyZMzB0ZIhz"
+    "gX9/9B/seOsdzKmdg84XO/Do4+vo7Hzuok73g9F9o"
+    "BtLlizBqlWrVInPPvvM8LA6JQB1TJ3c8c47KOSvCD"
+    "+45VbUzp0DJ+nAtm2knBRc5rZlW0ZWswMDh8362dk"
+    "56O3RFyCw5Pu3YMqUqbjkkktMXyKewLKly017xcq7"
+    "0dDYgLb5zVh6220Ex9Ohucnea+fNw+LFi7FgwQJKw"
+    "CeffGJ4WI0IQKNmWxa84CaYPmMGWpqbUJ5XgrzcXL"
+    "OGAoxGotCxzDaji2ZHDRfO3b//gGkvumEhaq6uwcD"
+    "AgJHjiQQ+/fS/qKiowNy6OcjJyUZFeQVaW1q4A0IQ"
+    "PCAcecfyZVi4cCEmTZpECdi7d6/hYTUiAI18NBqFn"
+    "WWb8V980cUo+1Oqqqp8py1BaVmp2RFahj3oIWJlmf"
+    "EigiODg1QLZs2aBcsBLhzrX496qBX8wOEBlJSUmPF"
+    "aHeo7BD1xsRhvDSr0NyIylJaWKsPHH39seFj53gTS"
+    "7t27UV1djcyfLSLRCHsFxcVFJmK3L7sT3128BH/94"
+    "ANGycPnuz5H7bVzOQaYUjUVE6svw/btbxtZKw2A8o"
+    "K8Auj1WDNzporo2rUXtzK39Zq8asp0rFh+D8ZfNBG"
+    "TmWbJZBIHuv2dy+cPWjqhvLxcGd5//33Dw2oYgA0b"
+    "NmDXrl3YvHmz6Y9EIrhi6lS+roBn2VdYWIjXtryON"
+    "/+4HdfOq4OIoONXnfjJgz9ihEp4PfaYFNFxuoDHmd"
+    "O/Nh3Z2dlmrOrm8Pwo38/Dee+qlfwxoQ2aZq/9bjN"
+    "SvLbvumM5kjxXNTNrUDVhAnfc333btqH+7Nu3T6en"
+    "aRiA1atX45lnnsHkyZPNgFdfeRkr7rrTtL/x9euw4"
+    "akn8dKmjXh5UydWrrgbL27sQNN19Zg0tgpPPf4Y+z"
+    "oNbXjqCbzw6+dMiq155CFseO5pEAvEzuLvO9XoeP4"
+    "5jBtXSQfH496V92BTZwc2drxAeh5NTY0G8F133oGH"
+    "f7YGUZMBxgXw12isX7/eF4J6GICysjLM46kP866tt"
+    "QXtLU2wRcxC7fyppKG+Hg0NDVjU3opWHuh5dXWwXM"
+    "EC9jU1zkczaWF7G66eNRP6e+blUy5Ha30TLF7FatO"
+    "2LNTVzsWVV1yhImZfcw1ampvNjjbzvm/k2hbP1dQp"
+    "l6G9rS29czq4hQe8jTpth2SFjZBPmzbNbJWR6biI+"
+    "E3WXBe5uTkmQhSRzehEmWbaVsphquRkR2kUGD9hvK"
+    "qY9x70sBqBHydAKmegRI6um8VLoqioyNh1+R7xe8w"
+    "MZLY1jTQd/R6/Pg6Ar/ZrvYVSvI+V+5qjNe2kBYvO"
+    "aNRChRrNiguEt47q2A1LPxtlTOKyw5yDZUOd1/FK+"
+    "j4RbZyCRgSQOdfianzSKn4MAj+DAeodAO2zOUgdgx"
+    "Z6YCcEtiOmD0FRDOkx1HEYYOm1K5RgxhodTq+MCEA"
+    "XyoyKWf3Yde0okEUK9OqcAtO5gcowldV5IwSVjj2q"
+    "82AxGCI+EB0iIhARbZ6UrJP2ZHQoiKOG/I6ILTSIo"
+    "Ag01Vz1KNBkMnU+Uz62LW6KZyWVVqstpbRihMaIAH"
+    "LzxjA1/XtYnfAg0KswXE9TxkrxjRlY89iRxRWJjS3"
+    "/UZ3fAkR8QlA04roG9I4NdJnnzbJtFJdXBj0nZjR3"
+    "4g7VimWhsKQcY4rLaJzWqRQeNiuSzbcwheCx3AR8R"
+    "3yFOmpxOB+jEJH0fKNgJUpakeujQEPnRfjm501VVF"
+    "p+3Dwdm0kjAggH2vyoXFBagdwxRaEKmlaaNmo4VCq"
+    "IYDOMin4gE4hRHlPpOplr5I0pQFnlWGRlRY4ZeWLx"
+    "tACEUyPRKAp5X2fn5IQqsxOZqa/OqCzpEUGDyIbph"
+    "BcrdUEvonyHlFaOQ05efqg6Lf6lAIQr6suksKwSke"
+    "zcUEUgnqG0gt5q9FUeHmWB2FkwW8NOiylZwjwvKCq"
+    "h9OWfMwIQmsnldhcytexI5jXqwc2IbDhWue4ORFtK"
+    "gsLiUpTwO4DFs6aaM6GzAmAMiiC/sBj5POxi+zeW6"
+    "oWeiog2uTO8Z4z3RkQuvwyV8eNxJBr1FWdRnz2AwL"
+    "gwp/OLyqC3lpwkohHuVFlFJfIy/lEdTD9jNmoAQg8"
+    "s20YR0yq3QG8sfwcUUClTpbCklMN8HRuj8hgAev+O"
+    "Nlm8BvP4/hhTVAp1XkGMtg2NgKWLbt26FV8VbXvjj"
+    "a9sbfX9/wAAAP//31RJ1wAAAAZJREFUAwDRh2MbCE"
+    "VJHwAAAABJRU5ErkJggg=="    
+)
+def load_app_icon():
+    """Возвращает QIcon, декодированный из APP_ICON_B64."""
+    if not APP_ICON_B64 or APP_ICON_B64 == "ВСТАВЬ СЮДА BASE64":
+        return QIcon()
+    try:
+        data = base64.b64decode(APP_ICON_B64)
+    except Exception:
+        return QIcon()
+    pm = QPixmap()
+    if not pm.loadFromData(data, "PNG"):
+        return QIcon()
+    return QIcon(pm)
 
 
 # ============================================================
@@ -2986,6 +3101,8 @@ def main():
     app.setFont(QFont("Tahoma", 8))
     app.setStyleSheet(build_win98_qss())
 
+    app.setWindowIcon(load_app_icon())
+    
     try:
         log_path = os.path.join(get_config_dir(), "dotlauncher.log")
         logging.basicConfig(
