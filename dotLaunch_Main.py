@@ -101,9 +101,10 @@ COPYABLE_DIRS = (
 SKIP_DIRS = {
     "saves", "logs", "crash-reports",
     "versions", "libraries", "assets", "screenshots",
+    "disabledMods",
 }
 
-APP_ICON_B64 = (     
+APP_ICON_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXA"
     "vmHAAALiUlEQVR4AdRZa4xV1RX+1jlz77yY9wMURn"
     "AUEVEoIwIzaDvDvAFtrY0toqURfCDoH2JtmyYmklp"
@@ -177,8 +178,8 @@ APP_ICON_B64 = (
     "EC9jU1zkczaWF7G66eNRP6e+blUy5Ha30TLF7FatO"
     "2LNTVzsWVV1yhImZfcw1ampvNjjbzvm/k2hbP1dQp"
     "l6G9rS29czq4hQe8jTpth2SFjZBPmzbNbJWR6biI+"
-    "E3WXBe5uTkmQhSRzehEmWbaVsphquRkR2kUGD9hvK"
-    "qY9x70sBqBHydAKmegRI6um8VLoqioyNh1+R7xe8w"
+    "E3WXBe5uTkmQhSRzehEmWbaVsphquRkR2kUGD9hvKq"
+    "Y9x70sBqBHydAKmegRI6um8VLoqioyNh1+R7xe8w"
     "MZLY1jTQd/R6/Pg6Ar/ZrvYVSvI+V+5qjNe2kBYvO"
     "aNRChRrNiguEt47q2A1LPxtlTOKyw5yDZUOd1/FK+"
     "j4RbZyCRgSQOdfianzSKn4MAj+DAeodAO2zOUgdgx"
@@ -202,8 +203,10 @@ APP_ICON_B64 = (
     "s20YR0yq3QG8sfwcUUClTpbCklMN8HRuj8hgAev+O"
     "Nlm8BvP4/hhTVAp1XkGMtg2NgKWLbt26FV8VbXvjj"
     "a9sbfX9/wAAAP//31RJ1wAAAAZJREFUAwDRh2MbCE"
-    "VJHwAAAABJRU5ErkJggg=="    
+    "VJHwAAAABJRU5ErkJggg=="
 )
+
+
 def load_app_icon():
     """Возвращает QIcon, декодированный из APP_ICON_B64."""
     if not APP_ICON_B64 or APP_ICON_B64 == "ВСТАВЬ СЮДА BASE64":
@@ -943,6 +946,69 @@ def read_mod_info(jar_path):
                 if info:
                     return info
 
+    except Exception:
+        pass
+    return None
+
+
+def read_mod_display_name(jar_path):
+    """
+    Пытается получить человекочитаемое имя мода из его метаданных.
+    Возвращает строку или None, если имя извлечь не удалось.
+    """
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            namelist = zf.namelist()
+
+            # Fabric
+            if "fabric.mod.json" in namelist:
+                try:
+                    with zf.open("fabric.mod.json") as fm:
+                        data = json.load(fm)
+                    if isinstance(data, dict):
+                        name = data.get("name")
+                        if name:
+                            return str(name).strip() or None
+                except Exception:
+                    pass
+
+            # Forge
+            if "META-INF/mods.toml" in namelist and tomllib is not None:
+                try:
+                    with zf.open("META-INF/mods.toml") as fm:
+                        content = fm.read().decode("utf-8", errors="replace")
+                    data = tomllib.loads(content)
+                    mods = data.get("mods")
+                    if isinstance(mods, list) and mods:
+                        first = mods[0]
+                        if isinstance(first, dict):
+                            name = (
+                                first.get("displayName")
+                                or first.get("modId")
+                            )
+                            if name:
+                                return str(name).strip() or None
+                except Exception:
+                    pass
+
+            # NeoForge
+            if "META-INF/neoforge.mods.toml" in namelist and tomllib is not None:
+                try:
+                    with zf.open("META-INF/neoforge.mods.toml") as fm:
+                        content = fm.read().decode("utf-8", errors="replace")
+                    data = tomllib.loads(content)
+                    mods = data.get("mods")
+                    if isinstance(mods, list) and mods:
+                        first = mods[0]
+                        if isinstance(first, dict):
+                            name = (
+                                first.get("displayName")
+                                or first.get("modId")
+                            )
+                            if name:
+                                return str(name).strip() or None
+                except Exception:
+                    pass
     except Exception:
         pass
     return None
@@ -2197,6 +2263,23 @@ class DropZone(QLabel):
 
 
 # ============================================================
+#  СПИСОК МОДОВ С КЛИКОМ ЛЮБОЙ КНОПКОЙ
+# ============================================================
+class ModsListWidget(QListWidget):
+    """
+    QListWidget, который испускает сигнал modClicked при клике
+    ЛЮБОЙ кнопкой мыши по элементу списка.
+    """
+    modClicked = pyqtSignal(QListWidgetItem)
+
+    def mousePressEvent(self, event):
+        item = self.itemAt(event.pos())
+        super().mousePressEvent(event)
+        if item is not None:
+            self.modClicked.emit(item)
+
+
+# ============================================================
 #  ГЛАВНОЕ ОКНО
 # ============================================================
 class DotLauncher(QMainWindow):
@@ -2209,6 +2292,7 @@ class DotLauncher(QMainWindow):
         self.login_thread = None
         self.refresh_thread = None
         self.import_thread = None
+        self.mods_expanded = False
 
         self.config_dir = get_config_dir()
         self.config_path = os.path.join(self.config_dir, "dot_config.json")
@@ -2329,7 +2413,20 @@ class DotLauncher(QMainWindow):
 
         self.instance_list = QListWidget()
         self.instance_list.itemClicked.connect(self.on_instance_selected)
-        left_layout.addWidget(self.instance_list)
+        left_layout.addWidget(self.instance_list, 1)
+
+        # ---- Кнопка разворота сборки ----
+        self.expand_button = QPushButton("Развернуть сборку")
+        self.expand_button.setEnabled(False)
+        self.expand_button.clicked.connect(self.toggle_expand)
+        left_layout.addWidget(self.expand_button)
+
+        # ---- Список модов внутри выбранной сборки ----
+        self.mods_list = ModsListWidget()
+        self.mods_list.setVisible(False)
+        self.mods_list.setMinimumHeight(120)
+        self.mods_list.modClicked.connect(self.on_mod_clicked)
+        left_layout.addWidget(self.mods_list, 2)
 
         self.delete_button = QPushButton("Удалить сборку")
         self.delete_button.clicked.connect(self.delete_instance)
@@ -2822,6 +2919,9 @@ class DotLauncher(QMainWindow):
                     self.instance_list.setCurrentItem(item)
                     break
 
+        # Обновляем состояние кнопки разворота
+        self.expand_button.setEnabled(bool(self.current_instance))
+
     def on_instance_selected(self, item):
         instance_id = item.data(Qt.ItemDataRole.UserRole)
         if instance_id in self.instances:
@@ -2837,6 +2937,151 @@ class DotLauncher(QMainWindow):
             self.instance_info.setVisible(True)
             self.title_label.setVisible(False)
             self.status_bar.showMessage(f"Выбрана сборка: {inst['name']}")
+
+            self.expand_button.setEnabled(True)
+
+            # Если список модов развёрнут — перезаполним его
+            if self.mods_expanded:
+                self._populate_mods_list()
+
+    # ---------- РАЗВОРОТ СБОРКИ / УПРАВЛЕНИЕ МОДАМИ ----------
+    def toggle_expand(self):
+        if not self.current_instance:
+            return
+        self.mods_expanded = not self.mods_expanded
+        if self.mods_expanded:
+            self.expand_button.setText("Свернуть сборку")
+            self.mods_list.setVisible(True)
+            self._populate_mods_list()
+        else:
+            self.expand_button.setText("Развернуть сборку")
+            self.mods_list.setVisible(False)
+            self.mods_list.clear()
+
+    def _populate_mods_list(self):
+        self.mods_list.clear()
+        if not self.current_instance or self.current_instance not in self.instances:
+            return
+
+        inst = self.instances[self.current_instance]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        mods_dir = os.path.join(minecraft_dir, "mods")
+        disabled_dir = os.path.join(minecraft_dir, "disabledMods")
+
+        # Включённые моды
+        if os.path.isdir(mods_dir):
+            try:
+                enabled = sorted(
+                    f for f in os.listdir(mods_dir)
+                    if f.lower().endswith(".jar")
+                )
+            except OSError:
+                enabled = []
+            for fn in enabled:
+                self._add_mod_item(fn, disabled=False)
+
+        # Выключенные моды
+        if os.path.isdir(disabled_dir):
+            try:
+                disabled = sorted(
+                    f for f in os.listdir(disabled_dir)
+                    if f.lower().endswith(".jar")
+                )
+            except OSError:
+                disabled = []
+            for fn in disabled:
+                self._add_mod_item(fn, disabled=True)
+
+        if self.mods_list.count() == 0:
+            placeholder = QListWidgetItem("— нет модов —")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            placeholder.setForeground(QColor("#808080"))
+            self.mods_list.addItem(placeholder)
+
+    def _add_mod_item(self, filename, disabled):
+        inst = self.instances[self.current_instance]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        sub = "disabledMods" if disabled else "mods"
+        full_path = os.path.join(minecraft_dir, sub, filename)
+
+        display_name = None
+        if os.path.isfile(full_path):
+            try:
+                display_name = read_mod_display_name(full_path)
+            except Exception:
+                display_name = None
+
+        if display_name and display_name != filename:
+            text = f"{display_name}  [{filename}]"
+        else:
+            text = filename
+
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, {
+            "filename": filename,
+            "disabled": disabled,
+        })
+        item.setToolTip(
+            "Клик — " + ("включить" if disabled else "выключить") + " мод"
+        )
+
+        if disabled:
+            # Визуально «более серый» фон для выключенных модов
+            item.setForeground(QColor("#707070"))
+            item.setBackground(QColor("#d8d8d8"))
+
+        self.mods_list.addItem(item)
+
+    def on_mod_clicked(self, item):
+        if not self.current_instance or self.current_instance not in self.instances:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+
+        filename = data.get("filename")
+        disabled = data.get("disabled", False)
+        if not filename:
+            return
+
+        inst = self.instances[self.current_instance]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        mods_dir = os.path.join(minecraft_dir, "mods")
+        disabled_dir = os.path.join(minecraft_dir, "disabledMods")
+
+        src_dir = disabled_dir if disabled else mods_dir
+        dst_dir = mods_dir if disabled else disabled_dir
+        src = os.path.join(src_dir, filename)
+
+        if not os.path.isfile(src):
+            self.log(f"[Внимание] Файл мода не найден: {src}")
+            self._populate_mods_list()
+            return
+
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+            target_name = filename
+            target = os.path.join(dst_dir, target_name)
+            # На случай конфликта имён
+            if os.path.exists(target):
+                base, ext = os.path.splitext(filename)
+                i = 1
+                while os.path.exists(os.path.join(dst_dir, f"{base}_{i}{ext}")):
+                    i += 1
+                target_name = f"{base}_{i}{ext}"
+                target = os.path.join(dst_dir, target_name)
+            shutil.move(src, target)
+            state = "выключен" if not disabled else "включён"
+            self.log(f"[dotLauncher] Мод {target_name} {state}.")
+        except Exception as e:
+            self.log(f"[Ошибка] Не удалось переключить мод {filename}: {e}")
+            return
+
+        # Перерисуем список, чтобы отразить новое состояние
+        self._populate_mods_list()
 
     def delete_instance(self):
         if not self.current_instance:
@@ -2882,6 +3127,11 @@ class DotLauncher(QMainWindow):
         self.instance_info.setVisible(False)
         self.drop_zone.setVisible(True)
         self.title_label.setVisible(True)
+        self.expand_button.setEnabled(False)
+        self.expand_button.setText("Развернуть сборку")
+        self.mods_expanded = False
+        self.mods_list.setVisible(False)
+        self.mods_list.clear()
         self.log(f"[dotLauncher] Сборка «{inst['name']}» удалена.")
 
     # ---------- MODRINTH ----------
@@ -2912,6 +3162,10 @@ class DotLauncher(QMainWindow):
         )
         window.exec()
         self.log(f"[dotLauncher] Modrinth: окно закрыто для «{inst['name']}».")
+
+        # Обновим список модов, если он развёрнут
+        if self.mods_expanded:
+            self._populate_mods_list()
 
     # ---------- ЗАПУСК ИГРЫ ----------
     def play_game(self):
@@ -3102,7 +3356,7 @@ def main():
     app.setStyleSheet(build_win98_qss())
 
     app.setWindowIcon(load_app_icon())
-    
+
     try:
         log_path = os.path.join(get_config_dir(), "dotlauncher.log")
         logging.basicConfig(
