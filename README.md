@@ -24,7 +24,7 @@
 - **Forge**
 - **NeoForge**
 
-Лаунчер автоматически определяет нужный загрузчик по метаданным `.jar`-файла (`fabric.mod.json`, `META-INF/mods.toml`, `META-INF/neoforge.mods.toml`) и сам подбирает подходящую версию.
+Лаунчер автоматически определяет нужный загрузчик по метаданным `.jar`-файла и сам подбирает подходящую версию.
 
 ### Modrinth прямо в лаунчере
 - **Поиск модов** прямо из лаунчера по названию.
@@ -33,9 +33,13 @@
  
 ### Авторизация
 - **Offline** — игра без входа в сеть под любым ником.
-- **Ely.by** — авторизация через `authlib-injector`, автообновление сессии перед запуском.
-  
-### Java
-- **Автопоиск Java 17+** на компьютере (JAVA_HOME, PATH, стандартные каталоги JVM).
-- **Ручной выбор** `java.exe` через диалог.
-- **Managed Java** — при включённой опции лаунчер сам скачает нужный для версии Minecraft runtime через `minecraft-launcher-lib`.
+- **Ely.by** — для скинов и минимального аккаунта.
+
+---
+
+## Скриншоты
+-Интерфейс лаунчера
+<img width="1021" height="719" alt="image" src="https://github.com/user-attachments/assets/0a275421-a775-4e48-be28-600ed31e5b8e" />
+
+-Скачивание через Modrinth
+<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/dcc7b024-f8a6-4ebe-b591-9adc6f9f5464" />
