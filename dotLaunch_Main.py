@@ -2154,7 +2154,7 @@ class ModrinthWindow(QDialog):
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
 
-        self.stack.addWidget(self._build_search_page())
+        self.stack.addWidget(self._page())
         self.stack.addWidget(self._build_confirm_page())
         self.stack.setCurrentIndex(0)
 
@@ -2189,12 +2189,12 @@ class ModrinthWindow(QDialog):
         row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Введите название...")
-        self.search_input.returnPressed.connect(self.)
+        self.search_input.returnPressed.connect(self.do_search)
         row.addWidget(self.search_input)
 
         search_btn = QPushButton("Найти")
         search_btn.setFixedWidth(90)
-        search_btn.clicked.connect(self.)
+        search_btn.clicked.connect(self.do_search)
         row.addWidget(search_btn)
         v.addLayout(row)
 
