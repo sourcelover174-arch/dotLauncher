@@ -2154,7 +2154,7 @@ class ModrinthWindow(QDialog):
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
 
-        self.stack.addWidget(self._page())
+        self.stack.addWidget(self._build_search_page())
         self.stack.addWidget(self._build_confirm_page())
         self.stack.setCurrentIndex(0)
 
