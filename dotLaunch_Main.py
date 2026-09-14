@@ -747,14 +747,12 @@ def migrate_accounts_format(cfg):
             if not (0 <= ai < len(valid)):
                 ai = 0
             cfg["active_account"] = ai
-            # Удаляем старые поля, чтобы не путались в конфиге
             for old_key in ("username", "email", "elyby_username", "elyby_uuid",
                             "elyby_access_token", "elyby_refresh_token",
                             "client_token"):
                 cfg.pop(old_key, None)
             return cfg
 
-    # Миграция из старого формата
     new_accounts = []
 
     if cfg.get("elyby_username") and cfg.get("elyby_access_token"):
@@ -1075,12 +1073,14 @@ def modrinth_session():
     return s
 
 
-def modrinth_search(query, loader, mc_version, limit=20):
+def modrinth_search(query, loader, mc_version, project_type="mod", limit=20):
     facets = [
-        ["project_type:mod"],
-        [f"categories:{loader}"],
+        [f"project_type:{project_type}"],
         [f"versions:{mc_version}"],
     ]
+    if project_type == "mod":
+        facets.append([f"categories:{loader}"])
+
     params = {
         "query": query,
         "facets": json.dumps(facets),
@@ -1092,11 +1092,12 @@ def modrinth_search(query, loader, mc_version, limit=20):
     return r.json().get("hits", [])
 
 
-def modrinth_get_versions(project_id, loader, mc_version):
+def modrinth_get_versions(project_id, loader, mc_version, project_type="mod"):
     params = {
-        "loaders": json.dumps([loader]),
         "game_versions": json.dumps([mc_version]),
     }
+    if project_type == "mod":
+        params["loaders"] = json.dumps([loader])
     s = modrinth_session()
     r = s.get(
         f"{MODRINTH_API}/project/{project_id}/version",
@@ -1944,15 +1945,18 @@ class InstanceInstallThread(QThread):
 class ModrinthSearchThread(QThread):
     finished_signal = pyqtSignal(bool, list, str)
 
-    def __init__(self, query, loader, mc_version):
+    def __init__(self, query, loader, mc_version, project_type="mod"):
         super().__init__()
         self.query = query
         self.loader = loader
         self.mc_version = mc_version
+        self.project_type = project_type
 
     def run(self):
         try:
-            hits = modrinth_search(self.query, self.loader, self.mc_version)
+            hits = modrinth_search(
+                self.query, self.loader, self.mc_version, self.project_type
+            )
             self.finished_signal.emit(True, hits, "")
         except Exception as e:
             self.finished_signal.emit(False, [], str(e))
@@ -1963,13 +1967,15 @@ class ModrinthDownloadThread(QThread):
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(bool, str)
 
-    def __init__(self, projects, mods_dir, loader, mc_version, download_deps):
+    def __init__(self, projects, target_dir, loader, mc_version,
+                 download_deps, project_type="mod"):
         super().__init__()
         self.projects = projects
-        self.mods_dir = mods_dir
+        self.target_dir = target_dir
         self.loader = loader
         self.mc_version = mc_version
         self.download_deps = download_deps
+        self.project_type = project_type
         self._stop = False
 
     def stop(self):
@@ -1981,7 +1987,9 @@ class ModrinthDownloadThread(QThread):
         visited.add(project_id)
 
         try:
-            versions = modrinth_get_versions(project_id, self.loader, self.mc_version)
+            versions = modrinth_get_versions(
+                project_id, self.loader, self.mc_version, self.project_type
+            )
         except Exception as e:
             self.log_signal.emit(f"[Modrinth] Ошибка получения версий {project_id}: {e}")
             return
@@ -1997,6 +2005,10 @@ class ModrinthDownloadThread(QThread):
         to_download[project_id] = v
 
         if not self.download_deps:
+            return
+
+        # Зависимости учитываем только для модов.
+        if self.project_type != "mod":
             return
 
         for dep in v.get("dependencies", []):
@@ -2035,7 +2047,7 @@ class ModrinthDownloadThread(QThread):
         if not url:
             return
 
-        dest = os.path.join(self.mods_dir, filename)
+        dest = os.path.join(self.target_dir, filename)
         if os.path.isfile(dest):
             self.log_signal.emit(f"[Modrinth] Уже установлен: {filename}")
             return
@@ -2062,7 +2074,7 @@ class ModrinthDownloadThread(QThread):
 
     def run(self):
         try:
-            os.makedirs(self.mods_dir, exist_ok=True)
+            os.makedirs(self.target_dir, exist_ok=True)
 
             to_download = {}
             visited = set()
@@ -2075,7 +2087,7 @@ class ModrinthDownloadThread(QThread):
 
             if not to_download:
                 self.finished_signal.emit(
-                    False, "Не найдено подходящих версий для выбранных модов."
+                    False, "Не найдено подходящих версий для выбранных проектов."
                 )
                 return
 
@@ -2102,12 +2114,15 @@ class ModrinthDownloadThread(QThread):
 #  ОКНО MODRINTH
 # ============================================================
 class ModrinthWindow(QDialog):
-    def __init__(self, instance_name, loader_id, mc_version, mods_dir, parent=None):
+    def __init__(self, instance_name, loader_id, mc_version, instance_dir, parent=None):
         super().__init__(parent)
         self.instance_name = instance_name
         self.loader_id = loader_id
         self.mc_version = mc_version
-        self.mods_dir = mods_dir
+        self.instance_dir = instance_dir
+        self.minecraft_dir = os.path.join(instance_dir, ".minecraft")
+
+        self.current_type = "mod"
 
         self.chosen = {}
         self._result_cards = []
@@ -2123,6 +2138,14 @@ class ModrinthWindow(QDialog):
 
     def modrinth_loader(self):
         return LOADER_TO_MODRINTH.get(self.loader_id, self.loader_id)
+
+    def _target_dir(self):
+        if self.current_type == "mod":
+            return os.path.join(self.minecraft_dir, "mods")
+        elif self.current_type == "resourcepack":
+            return os.path.join(self.minecraft_dir, "resourcepacks")
+        else:  # shader
+            return os.path.join(self.minecraft_dir, "shaderpacks")
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -2140,15 +2163,32 @@ class ModrinthWindow(QDialog):
         v = QVBoxLayout(page)
         v.setContentsMargins(0, 0, 0, 0)
 
-        header = QLabel(
-            f"Поиск модов для {self.loader_name()} {self.mc_version}"
+        # Заголовок: "Поиск [модов ▾] для Fabric 1.20.1"
+        header_row = QHBoxLayout()
+        header_row.setSpacing(4)
+
+        header_left = QLabel("Поиск")
+        header_left.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        header_row.addWidget(header_left)
+
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["модов", "ресурспаков", "шейдеров"])
+        self.type_combo.setFixedWidth(140)
+        self.type_combo.currentIndexChanged.connect(self.on_type_changed)
+        header_row.addWidget(self.type_combo)
+
+        self.header_suffix = QLabel(
+            f"для {self.loader_name()} {self.mc_version}"
         )
-        header.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
-        v.addWidget(header)
+        self.header_suffix.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        header_row.addWidget(self.header_suffix)
+
+        header_row.addStretch()
+        v.addLayout(header_row)
 
         row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Введите название мода...")
+        self.search_input.setPlaceholderText("Введите название...")
         self.search_input.returnPressed.connect(self.do_search)
         row.addWidget(self.search_input)
 
@@ -2212,12 +2252,12 @@ class ModrinthWindow(QDialog):
         self.log_area.setVisible(False)
         v.addWidget(self.log_area)
 
-        self.download_btn = QPushButton("Скачать моды")
+        self.download_btn = QPushButton("Скачать")
         self.download_btn.setFixedHeight(26)
         self.download_btn.clicked.connect(self.do_download)
         v.addWidget(self.download_btn)
 
-        self.deps_check = QCheckBox("Скачать все зависимости к модам")
+        self.deps_check = QCheckBox("Скачать все зависимости (только для модов)")
         self.deps_check.setChecked(True)
         v.addWidget(self.deps_check)
 
@@ -2227,6 +2267,36 @@ class ModrinthWindow(QDialog):
 
         return page
 
+    def on_type_changed(self, idx):
+        if idx == 0:
+            self.current_type = "mod"
+            self.header_suffix.setText(
+                f"для {self.loader_name()} {self.mc_version}"
+            )
+            self.search_input.setPlaceholderText("Введите название мода...")
+            self.deps_check.setEnabled(True)
+        elif idx == 1:
+            self.current_type = "resourcepack"
+            self.header_suffix.setText(f"для Minecraft {self.mc_version}")
+            self.search_input.setPlaceholderText("Введите название ресурспака...")
+            self.deps_check.setEnabled(False)
+        else:
+            self.current_type = "shader"
+            self.header_suffix.setText(f"для Minecraft {self.mc_version}")
+            self.search_input.setPlaceholderText("Введите название шейдера...")
+            self.deps_check.setEnabled(False)
+
+        # Если уже что-то искали — повторим поиск с новым типом
+        query = self.search_input.text().strip()
+        if query and not (self.search_thread and self.search_thread.isRunning()):
+            self.do_search()
+        else:
+            # Иначе просто очистим старые результаты
+            self.chosen.clear()
+            self._update_chosen_label()
+            self._clear_results()
+            self.search_status.setText("")
+
     def do_search(self):
         query = self.search_input.text().strip()
         if not query:
@@ -2234,11 +2304,14 @@ class ModrinthWindow(QDialog):
         if self.search_thread and self.search_thread.isRunning():
             return
 
+        self.chosen.clear()
+        self._update_chosen_label()
+
         self.search_status.setText("Поиск...")
         self._clear_results()
 
         self.search_thread = ModrinthSearchThread(
-            query, self.modrinth_loader(), self.mc_version
+            query, self.modrinth_loader(), self.mc_version, self.current_type
         )
         self.search_thread.finished_signal.connect(self.on_search_done)
         self.search_thread.start()
@@ -2298,8 +2371,6 @@ class ModrinthWindow(QDialog):
 
         btn = QPushButton("Скачать")
         btn.setFixedSize(110, 26)
-        if pid in self.chosen:
-            btn.setText("Добавлено ✓")
 
         def on_click(_checked=False, _pid=pid, _hit=hit, _btn=btn):
             if _pid in self.chosen:
@@ -2321,7 +2392,7 @@ class ModrinthWindow(QDialog):
 
     def go_to_confirm(self):
         if not self.chosen:
-            QMessageBox.information(self, "Пусто", "Выберите хотя бы один мод.")
+            QMessageBox.information(self, "Пусто", "Выберите хотя бы один проект.")
             return
 
         self.confirm_list.clear()
@@ -2332,9 +2403,15 @@ class ModrinthWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, pid)
             self.confirm_list.addItem(item)
 
+        type_label = {
+            "mod": "модов",
+            "resourcepack": "ресурспаков",
+            "shader": "шейдеров",
+        }.get(self.current_type, "проектов")
+
         self.confirm_label.setText(
             f"Будет установлено в сборку «{self.instance_name}»: "
-            f"{len(self.chosen)} мод(ов)."
+            f"{len(self.chosen)} {type_label}."
         )
         self.stack.setCurrentIndex(1)
 
@@ -2350,7 +2427,9 @@ class ModrinthWindow(QDialog):
             QMessageBox.information(self, "Пусто", "Список пуст.")
             return
 
-        download_deps = self.deps_check.isChecked()
+        download_deps = (
+            self.deps_check.isChecked() and self.current_type == "mod"
+        )
 
         self.download_btn.setEnabled(False)
         self.download_btn.setText("Скачивание...")
@@ -2361,10 +2440,11 @@ class ModrinthWindow(QDialog):
 
         self.download_thread = ModrinthDownloadThread(
             projects,
-            self.mods_dir,
+            self._target_dir(),
             self.modrinth_loader(),
             self.mc_version,
             download_deps,
+            self.current_type,
         )
         self.download_thread.log_signal.connect(self.log_area.append)
         self.download_thread.progress_signal.connect(self._update_progress)
@@ -2380,7 +2460,7 @@ class ModrinthWindow(QDialog):
 
     def on_download_done(self, success, message):
         self.download_btn.setEnabled(True)
-        self.download_btn.setText("Скачать моды")
+        self.download_btn.setText("Скачать")
         if success:
             QMessageBox.information(self, "Готово", message)
             self.accept()
@@ -2581,7 +2661,6 @@ class AddProfileDialog(QDialog):
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         layout.addWidget(self.type_combo)
 
-        # --- Offline ---
         self.offline_widget = QWidget()
         off_l = QVBoxLayout(self.offline_widget)
         off_l.setContentsMargins(0, 0, 0, 0)
@@ -2591,7 +2670,6 @@ class AddProfileDialog(QDialog):
         off_l.addWidget(self.name_input)
         layout.addWidget(self.offline_widget)
 
-        # --- Ely.by ---
         self.elyby_widget = QWidget()
         ely_l = QVBoxLayout(self.elyby_widget)
         ely_l.setContentsMargins(0, 0, 0, 0)
@@ -2729,8 +2807,6 @@ class ModsListWidget(QListWidget):
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
-        # Только левая кнопка мыши переключает мод.
-        # ПКМ используется для контекстного меню и не должна менять состояние.
         if event.button() != Qt.MouseButton.LeftButton:
             return
         index = self.indexAt(event.pos())
@@ -2865,7 +2941,6 @@ class DotLauncher(QMainWindow):
         instances_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         left_layout.addWidget(instances_label)
 
-        # ---- Кнопка "Новая сборка" (всегда сверху) ----
         self.new_instance_button = QPushButton("＋ Новая сборка")
         self.new_instance_button.clicked.connect(self.open_new_instance_dialog)
         left_layout.addWidget(self.new_instance_button)
@@ -2880,7 +2955,6 @@ class DotLauncher(QMainWindow):
         )
         left_layout.addWidget(self.instance_list, 1)
 
-        # ---- Список модов внутри выбранной сборки ----
         self.mods_list = ModsListWidget()
         self.mods_list.setVisible(False)
         self.mods_list.setMinimumHeight(120)
@@ -3067,7 +3141,6 @@ class DotLauncher(QMainWindow):
 
         self.refresh_instance_list()
 
-        # Профили аккаунтов
         self.refresh_account_combo()
         acc = self._active_account()
         if acc and acc.get("type") == "elyby" and acc.get("refresh_token"):
@@ -3265,7 +3338,6 @@ class DotLauncher(QMainWindow):
         self.log(f"[dotLauncher] Профиль «{name}» удалён.")
 
     def _refresh_elyby_silent(self, acc):
-        """Тихо обновляет токен в фоне, не блокируя UI."""
         client_token = acc.get("client_token")
         access_token = acc.get("access_token")
         if not client_token or not access_token:
@@ -3290,7 +3362,6 @@ class DotLauncher(QMainWindow):
         self.log("[dotLauncher] Сессия Ely.by обновлена.")
 
     def _refresh_active_elyby_blocking(self):
-        """Синхронный refresh активного Ely.by-профиля перед запуском."""
         acc = self._active_account()
         if not acc or acc.get("type") != "elyby":
             return
@@ -3565,7 +3636,6 @@ class DotLauncher(QMainWindow):
         item = self.instance_list.itemAt(pos)
         menu = QMenu(self)
 
-        # --- Пустая область списка ---
         if item is None:
             act_new = menu.addAction("Новая сборка")
             act_import = menu.addAction("Импорт модпака")
@@ -3583,7 +3653,6 @@ class DotLauncher(QMainWindow):
             return
         inst = self.instances[instance_id]
 
-        # --- Сборка ещё скачивается ---
         if inst.get("installing"):
             act_info = menu.addAction("Скачивается...")
             act_info.setEnabled(False)
@@ -4089,13 +4158,12 @@ class DotLauncher(QMainWindow):
 
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
-        mods_dir = os.path.join(instance_dir, ".minecraft", "mods")
 
         window = ModrinthWindow(
             inst["name"],
             inst["loader"],
             inst["version"],
-            mods_dir,
+            instance_dir,
             parent=self,
         )
         window.exec()
