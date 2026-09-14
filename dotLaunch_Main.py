@@ -2189,12 +2189,12 @@ class ModrinthWindow(QDialog):
         row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Введите название...")
-        self.search_input.returnPressed.connect(self.do_search)
+        self.search_input.returnPressed.connect(self.)
         row.addWidget(self.search_input)
 
         search_btn = QPushButton("Найти")
         search_btn.setFixedWidth(90)
-        search_btn.clicked.connect(self.do_search)
+        search_btn.clicked.connect(self.)
         row.addWidget(search_btn)
         v.addLayout(row)
 
@@ -2303,10 +2303,7 @@ class ModrinthWindow(QDialog):
             return
         if self.search_thread and self.search_thread.isRunning():
             return
-
-        self.chosen.clear()
-        self._update_chosen_label()
-
+            
         self.search_status.setText("Поиск...")
         self._clear_results()
 
@@ -2371,6 +2368,8 @@ class ModrinthWindow(QDialog):
 
         btn = QPushButton("Скачать")
         btn.setFixedSize(110, 26)
+        if pid in self.chosen:
+            btn.setText("Добавлено ✓")
 
         def on_click(_checked=False, _pid=pid, _hit=hit, _btn=btn):
             if _pid in self.chosen:
