@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
     QLabel, QListWidget, QListWidgetItem, QPushButton, QLineEdit,
     QComboBox, QTextEdit, QFileDialog, QInputDialog, QMessageBox,
     QSplitter, QFrame, QProgressBar, QSpinBox, QCheckBox,
-    QDialog, QStackedWidget, QScrollArea,
+    QDialog, QStackedWidget, QScrollArea, QMenu,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QStandardPaths,
@@ -642,10 +642,24 @@ QMenu {
     border-bottom: 2px solid #404040;
     border-right: 2px solid #404040;
 }
+QMenu::item {
+    background-color: transparent;
+    color: #000000;
+    padding: 3px 24px 3px 20px;
+}
 QMenu::item:selected {
     background-color: #000080;
     color: #ffffff;
 }
+QMenu::item:disabled {
+    color: #808080;
+}
+QMenu::separator {
+    height: 1px;
+    background-color: #808080;
+    margin: 3px 2px 3px 2px;
+}
+
 QToolTip {
     background-color: #ffffe1;
     color: #000000;
@@ -1714,7 +1728,7 @@ class ModpackImportThread(QThread):
 
 
 # ============================================================
-#  НОВЫЙ ПОТОК: ЗАГРУЗКА СПИСКА ВЕРСИЙ MINECRAFT
+#  ПОТОК: ЗАГРУЗКА СПИСКА ВЕРСИЙ MINECRAFT
 # ============================================================
 class VersionFetchThread(QThread):
     finished_signal = pyqtSignal(bool, list, str)
@@ -1728,7 +1742,7 @@ class VersionFetchThread(QThread):
 
 
 # ============================================================
-#  НОВЫЙ ПОТОК: СОЗДАНИЕ ЧИСТОЙ СБОРКИ (без модов)
+#  ПОТОК: СОЗДАНИЕ ЧИСТОЙ СБОРКИ (без модов)
 # ============================================================
 class InstanceInstallThread(QThread):
     log_signal = pyqtSignal(str)
@@ -2326,7 +2340,7 @@ class ModrinthWindow(QDialog):
 
 
 # ============================================================
-#  НОВОЕ ОКНО: СОЗДАНИЕ СБОРКИ
+#  ОКНО: СОЗДАНИЕ СБОРКИ
 # ============================================================
 class NewInstanceDialog(QDialog):
     def __init__(self, parent=None):
@@ -2675,28 +2689,26 @@ class DotLauncher(QMainWindow):
 
         self.instance_list = QListWidget()
         self.instance_list.itemClicked.connect(self.on_instance_selected)
+        self.instance_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.instance_list.customContextMenuRequested.connect(
+            self.on_instance_context_menu
+        )
         left_layout.addWidget(self.instance_list, 1)
-
-        # ---- Кнопка разворота сборки ----
-        self.expand_button = QPushButton("Развернуть сборку")
-        self.expand_button.setEnabled(False)
-        self.expand_button.clicked.connect(self.toggle_expand)
-        left_layout.addWidget(self.expand_button)
 
         # ---- Список модов внутри выбранной сборки ----
         self.mods_list = ModsListWidget()
         self.mods_list.setVisible(False)
         self.mods_list.setMinimumHeight(120)
         self.mods_list.modRowClicked.connect(self.on_mod_row_clicked)
+        self.mods_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.mods_list.customContextMenuRequested.connect(
+            self.on_mods_context_menu
+        )
         left_layout.addWidget(self.mods_list, 2)
-
-        self.delete_button = QPushButton("Удалить сборку")
-        self.delete_button.clicked.connect(self.delete_instance)
-        left_layout.addWidget(self.delete_button)
-
-        self.open_folder_button = QPushButton("Открыть папку сборки")
-        self.open_folder_button.clicked.connect(self.open_instance_folder)
-        left_layout.addWidget(self.open_folder_button)
 
         self.modrinth_button = QPushButton("Скачать из Modrinth")
         self.modrinth_button.clicked.connect(self.open_modrinth_window)
@@ -2890,7 +2902,6 @@ class DotLauncher(QMainWindow):
         for iid, inst in raw.items():
             if not isinstance(inst, dict):
                 continue
-            # Пропускаем незавершённые установки из прошлых запусков
             if inst.get("installing"):
                 continue
             name = inst.get("name")
@@ -3091,7 +3102,6 @@ class DotLauncher(QMainWindow):
             return
 
         self.play_button.setEnabled(False)
-        self.delete_button.setEnabled(False)
         self.status_bar.showMessage("Импорт модпака...")
 
         self.import_thread = ModpackImportThread(
@@ -3104,6 +3114,18 @@ class DotLauncher(QMainWindow):
         self.import_thread.ask_signal.connect(self.on_import_ask)
         self.import_thread.finished_signal.connect(self.on_import_finished)
         self.import_thread.start()
+
+    def import_modpack_dialog(self):
+        """Диалог выбора .zip/.jar для импорта модпака."""
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Выберите модпак, архив или моды для импорта",
+            "",
+            "Модпаки и моды (*.zip *.jar);;Все файлы (*)",
+        )
+        if not files:
+            return
+        self.handle_dropped_files(files)
 
     def on_import_ask(self, versions, loaders):
         thread = self.import_thread
@@ -3156,7 +3178,6 @@ class DotLauncher(QMainWindow):
 
     def on_import_finished(self, success, info):
         self.play_button.setEnabled(True)
-        self.delete_button.setEnabled(True)
         self.status_bar.showMessage("Готов")
 
         if not success:
@@ -3200,7 +3221,6 @@ class DotLauncher(QMainWindow):
         )
 
     def _start_instance_install(self, name, version, loader_id):
-        # Разрешаем Java, если пользователь не выбрал managed.
         java_path = None
         if not self.managed_java_check.isChecked():
             try:
@@ -3209,8 +3229,6 @@ class DotLauncher(QMainWindow):
             except Exception:
                 java_path = None
 
-        # Генерируем ID и сразу создаём запись-заглушку,
-        # чтобы сборка сразу появилась в списке с пометкой [СКАЧИВАЕТСЯ].
         existing = set(self.instances.keys())
         if os.path.isdir(self.config["instances_dir"]):
             try:
@@ -3234,7 +3252,6 @@ class DotLauncher(QMainWindow):
         self.refresh_instance_list()
 
         self.play_button.setEnabled(False)
-        self.delete_button.setEnabled(False)
         self.new_instance_button.setEnabled(False)
         self.status_bar.showMessage(f"Создание сборки «{name}»...")
         self.log(
@@ -3263,14 +3280,12 @@ class DotLauncher(QMainWindow):
 
     def on_instance_install_finished(self, success, info, error):
         self.play_button.setEnabled(True)
-        self.delete_button.setEnabled(True)
         self.new_instance_button.setEnabled(True)
         self.status_bar.showMessage("Готов")
 
         iid = info.get("instance_id") if isinstance(info, dict) else None
 
         if not success:
-            # Удаляем запись-заглушку
             if iid and iid in self.instances:
                 del self.instances[iid]
                 self.save_instances()
@@ -3297,6 +3312,193 @@ class DotLauncher(QMainWindow):
             f"Сборка «{info['name']}» создана."
         )
 
+    # ---------- КОНТЕКСТНОЕ МЕНЮ: СБОРКИ ----------
+    def on_instance_context_menu(self, pos):
+        item = self.instance_list.itemAt(pos)
+        menu = QMenu(self)
+
+        # --- Пустая область списка: только создание/импорт ---
+        if item is None:
+            act_new = menu.addAction("Новая сборка")
+            act_import = menu.addAction("Импорт модпака")
+            chosen = menu.exec(self.instance_list.mapToGlobal(pos))
+            if chosen is None:
+                return
+            if chosen == act_new:
+                self.open_new_instance_dialog()
+            elif chosen == act_import:
+                self.import_modpack_dialog()
+            return
+
+        instance_id = item.data(Qt.ItemDataRole.UserRole)
+        if instance_id not in self.instances:
+            return
+        inst = self.instances[instance_id]
+
+        # --- Сборка ещё скачивается ---
+        if inst.get("installing"):
+            act_info = menu.addAction("Скачивается...")
+            act_info.setEnabled(False)
+            menu.exec(self.instance_list.mapToGlobal(pos))
+            return
+
+        launcher_running = (
+            self.launcher_thread is not None
+            and self.launcher_thread.isRunning()
+        )
+
+        # 1. Играть
+        act_play = menu.addAction("Играть")
+        act_play.setEnabled(not launcher_running)
+
+        # 2. Развернуть / Свернуть
+        if self.current_instance == instance_id and self.mods_expanded:
+            act_expand = menu.addAction("Свернуть сборку")
+        else:
+            act_expand = menu.addAction("Развернуть сборку")
+
+        # 3. Открыть папку сборки
+        act_folder = menu.addAction("Открыть папку сборки")
+
+        menu.addSeparator()
+
+        # 4. Удалить
+        act_delete = menu.addAction("Удалить сборку")
+        act_delete.setEnabled(not launcher_running)
+
+        chosen = menu.exec(self.instance_list.mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        # Все действия, кроме удаления, требуют, чтобы эта сборка была текущей.
+        if chosen in (act_play, act_expand, act_folder):
+            self._select_instance_by_id(instance_id)
+
+        if chosen == act_play:
+            self.play_game()
+        elif chosen == act_expand:
+            self.toggle_expand()
+        elif chosen == act_folder:
+            self.open_instance_folder()
+        elif chosen == act_delete:
+            self._select_instance_by_id(instance_id)
+            self.delete_instance()
+
+    def _select_instance_by_id(self, instance_id):
+        for i in range(self.instance_list.count()):
+            item = self.instance_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == instance_id:
+                if self.current_instance != instance_id:
+                    self.instance_list.setCurrentItem(item)
+                    self.on_instance_selected(item)
+                return True
+        return False
+
+    # ---------- КОНТЕКСТНОЕ МЕНЮ: МОДЫ ----------
+    def on_mods_context_menu(self, pos):
+        item = self.mods_list.itemAt(pos)
+        if item is None:
+            return
+
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+
+        filename = data.get("filename")
+        disabled = data.get("disabled", False)
+        if not filename:
+            return
+
+        menu = QMenu(self)
+
+        # 1. Включить / Выключить
+        if disabled:
+            act_toggle = menu.addAction("Включить мод")
+        else:
+            act_toggle = menu.addAction("Выключить мод")
+
+        # 2. Открыть расположение файла
+        act_open = menu.addAction("Открыть расположение файла")
+
+        menu.addSeparator()
+
+        # 3. Удалить
+        act_delete = menu.addAction("Удалить мод")
+
+        chosen = menu.exec(self.mods_list.mapToGlobal(pos))
+        if chosen is None:
+            return
+
+        if chosen == act_toggle:
+            row = self.mods_list.row(item)
+            self.on_mod_row_clicked(row)
+        elif chosen == act_open:
+            self.open_mod_location(filename, disabled)
+        elif chosen == act_delete:
+            self.delete_mod(filename, disabled)
+
+    def open_mod_location(self, filename, disabled):
+        if not self.current_instance or self.current_instance not in self.instances:
+            return
+        inst = self.instances[self.current_instance]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        sub = "disabledMods" if disabled else "mods"
+        full_path = os.path.join(minecraft_dir, sub, filename)
+        if not os.path.isfile(full_path):
+            QMessageBox.warning(
+                self, "Файл не найден",
+                f"Файл мода не найден:\n{full_path}"
+            )
+            return
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(
+                    ["explorer", "/select,", os.path.normpath(full_path)]
+                )
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", full_path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(full_path)])
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Ошибка",
+                f"Не удалось открыть папку:\n{e}"
+            )
+
+    def delete_mod(self, filename, disabled):
+        if not self.current_instance or self.current_instance not in self.instances:
+            return
+        inst = self.instances[self.current_instance]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        sub = "disabledMods" if disabled else "mods"
+        full_path = os.path.join(minecraft_dir, sub, filename)
+        if not os.path.isfile(full_path):
+            QMessageBox.warning(
+                self, "Файл не найден",
+                f"Файл мода не найден:\n{full_path}"
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Удаление мода",
+            f"Удалить мод «{filename}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            os.remove(full_path)
+            self.log(f"[dotLauncher] Мод {filename} удалён.")
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Ошибка",
+                f"Не удалось удалить файл:\n{e}"
+            )
+            return
+        if self.mods_expanded:
+            self._populate_mods_list()
+
     # ---------- СПИСОК СБОРОК ----------
     def refresh_instance_list(self):
         self.instance_list.clear()
@@ -3319,8 +3521,6 @@ class DotLauncher(QMainWindow):
                     self.instance_list.setCurrentItem(item)
                     break
 
-        self.expand_button.setEnabled(bool(self.current_instance))
-
     def on_instance_selected(self, item):
         instance_id = item.data(Qt.ItemDataRole.UserRole)
         if instance_id in self.instances:
@@ -3330,7 +3530,6 @@ class DotLauncher(QMainWindow):
                     f"[Внимание] Сборка «{inst['name']}» ещё создаётся. "
                     f"Подождите завершения."
                 )
-                # Возвращаем выделение на текущую сборку
                 self.refresh_instance_list()
                 return
             self.current_instance = instance_id
@@ -3345,8 +3544,6 @@ class DotLauncher(QMainWindow):
             self.title_label.setVisible(False)
             self.status_bar.showMessage(f"Выбрана сборка: {inst['name']}")
 
-            self.expand_button.setEnabled(True)
-
             if self.mods_expanded:
                 self._populate_mods_list()
 
@@ -3356,11 +3553,9 @@ class DotLauncher(QMainWindow):
             return
         self.mods_expanded = not self.mods_expanded
         if self.mods_expanded:
-            self.expand_button.setText("Свернуть сборку")
             self.mods_list.setVisible(True)
             self._populate_mods_list()
         else:
-            self.expand_button.setText("Развернуть сборку")
             self.mods_list.setVisible(False)
             self.mods_list.clear()
 
@@ -3552,8 +3747,6 @@ class DotLauncher(QMainWindow):
         self.instance_info.setVisible(False)
         self.drop_zone.setVisible(True)
         self.title_label.setVisible(True)
-        self.expand_button.setEnabled(False)
-        self.expand_button.setText("Развернуть сборку")
         self.mods_expanded = False
         self.mods_list.setVisible(False)
         self.mods_list.clear()
@@ -3694,7 +3887,6 @@ class DotLauncher(QMainWindow):
         self.play_button.setText("Загрузка...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.delete_button.setEnabled(False)
 
         self.launcher_thread = LauncherThread(
             instance_dir, inst["version"], loader_id, loader_version,
@@ -3731,7 +3923,6 @@ class DotLauncher(QMainWindow):
         self.play_button.setEnabled(True)
         self.play_button.setText("ИГРАТЬ")
         self.progress_bar.setVisible(False)
-        self.delete_button.setEnabled(True)
         self.status_bar.showMessage("Готов" if success else f"Ошибка: {message}")
 
     # ---------- КОНСОЛЬ ----------
