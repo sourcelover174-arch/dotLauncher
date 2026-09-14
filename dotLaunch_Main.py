@@ -723,6 +723,72 @@ def sha256_file(path):
     return h.hexdigest().lower()
 
 
+def migrate_accounts_format(cfg):
+    """
+    Если конфиг в старом формате (единый аккаунт), конвертирует
+    в новый формат со списком accounts. Если уже в новом — валидирует.
+    Возвращает изменённый cfg.
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+
+    accounts = cfg.get("accounts")
+    if isinstance(accounts, list) and accounts:
+        valid = []
+        for acc in accounts:
+            if not isinstance(acc, dict):
+                continue
+            if acc.get("type") not in ("offline", "elyby"):
+                continue
+            valid.append(acc)
+        if valid:
+            cfg["accounts"] = valid
+            ai = safe_int(cfg.get("active_account"), 0)
+            if not (0 <= ai < len(valid)):
+                ai = 0
+            cfg["active_account"] = ai
+            # Удаляем старые поля, чтобы не путались в конфиге
+            for old_key in ("username", "email", "elyby_username", "elyby_uuid",
+                            "elyby_access_token", "elyby_refresh_token",
+                            "client_token"):
+                cfg.pop(old_key, None)
+            return cfg
+
+    # Миграция из старого формата
+    new_accounts = []
+
+    if cfg.get("elyby_username") and cfg.get("elyby_access_token"):
+        new_accounts.append({
+            "type": "elyby",
+            "email": cfg.get("email", "") or "",
+            "username": cfg["elyby_username"],
+            "uuid": cfg.get("elyby_uuid", "") or "",
+            "access_token": cfg["elyby_access_token"],
+            "refresh_token": cfg.get("elyby_refresh_token", "") or "",
+            "client_token": cfg.get("client_token", "") or str(uuid.uuid4()),
+        })
+
+    if cfg.get("username"):
+        new_accounts.append({
+            "type": "offline",
+            "name": cfg["username"],
+        })
+
+    if not new_accounts:
+        new_accounts.append({
+            "type": "offline",
+            "name": "",
+        })
+
+    cfg["accounts"] = new_accounts
+    cfg["active_account"] = 0
+    for old_key in ("username", "email", "elyby_username", "elyby_uuid",
+                    "elyby_access_token", "elyby_refresh_token",
+                    "client_token"):
+        cfg.pop(old_key, None)
+    return cfg
+
+
 # ============================================================
 #  ПОИСК JAVA
 # ============================================================
@@ -2364,7 +2430,6 @@ class NewInstanceDialog(QDialog):
         columns = QHBoxLayout()
         columns.setSpacing(8)
 
-        # --- Левая колонка: версии ---
         left = QVBoxLayout()
         left.setSpacing(4)
 
@@ -2377,7 +2442,6 @@ class NewInstanceDialog(QDialog):
         self.show_snapshots_cb.toggled.connect(self._refresh_versions)
         left.addWidget(self.show_snapshots_cb)
 
-        # --- Правая колонка: настройки ---
         right = QVBoxLayout()
         right.setSpacing(4)
 
@@ -2496,6 +2560,133 @@ class NewInstanceDialog(QDialog):
 
 
 # ============================================================
+#  ОКНО: СОЗДАНИЕ ПРОФИЛЯ
+# ============================================================
+class AddProfileDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Новый профиль")
+        self.setMinimumSize(400, 320)
+        self.result_data = None
+        self._login_thread = None
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel("Тип профиля:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Offline", "Ely.by"])
+        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
+        layout.addWidget(self.type_combo)
+
+        # --- Offline ---
+        self.offline_widget = QWidget()
+        off_l = QVBoxLayout(self.offline_widget)
+        off_l.setContentsMargins(0, 0, 0, 0)
+        off_l.addWidget(QLabel("Никнейм:"))
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Steve")
+        off_l.addWidget(self.name_input)
+        layout.addWidget(self.offline_widget)
+
+        # --- Ely.by ---
+        self.elyby_widget = QWidget()
+        ely_l = QVBoxLayout(self.elyby_widget)
+        ely_l.setContentsMargins(0, 0, 0, 0)
+        ely_l.addWidget(QLabel("Email:"))
+        self.email_input = QLineEdit()
+        ely_l.addWidget(self.email_input)
+        ely_l.addWidget(QLabel("Пароль:"))
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        ely_l.addWidget(self.password_input)
+        self.elyby_widget.setVisible(False)
+        layout.addWidget(self.elyby_widget)
+
+        layout.addStretch()
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+        self.ok_btn = QPushButton("Создать")
+        self.ok_btn.setDefault(True)
+        self.ok_btn.clicked.connect(self.on_ok)
+        btns.addWidget(self.ok_btn)
+        layout.addLayout(btns)
+
+    def _on_type_changed(self, idx):
+        is_offline = (idx == 0)
+        self.offline_widget.setVisible(is_offline)
+        self.elyby_widget.setVisible(not is_offline)
+        self.ok_btn.setText("Создать" if is_offline else "Войти и создать")
+        self.status_label.setText("")
+
+    def on_ok(self):
+        if self.type_combo.currentIndex() == 0:
+            name = self.name_input.text().strip()
+            if not name:
+                QMessageBox.warning(self, "Ошибка", "Введите никнейм.")
+                return
+            self.result_data = {
+                "type": "offline",
+                "name": name,
+            }
+            self.accept()
+        else:
+            email = self.email_input.text().strip()
+            password = self.password_input.text()
+            if not email or not password:
+                QMessageBox.warning(self, "Ошибка", "Введите email и пароль.")
+                return
+            self._start_elyby_login(email, password)
+
+    def _start_elyby_login(self, email, password):
+        self.ok_btn.setEnabled(False)
+        self.status_label.setText("Авторизация...")
+        client_token = str(uuid.uuid4())
+        self._login_thread = ElybyLoginThread(email, password, client_token)
+        self._login_thread.finished_signal.connect(self._on_login_done)
+        self._login_thread.start()
+
+    def _on_login_done(self, success, data, error):
+        self.ok_btn.setEnabled(True)
+        if not success:
+            self.status_label.setText(f"Ошибка: {error}")
+            return
+
+        access_token = data.get("accessToken")
+        refresh_token = data.get("refreshToken")
+        selected = data.get("selectedProfile", {})
+        uuid_val = selected.get("id")
+        username = selected.get("name")
+        new_client = data.get("clientToken")
+
+        if not access_token or not uuid_val or not username:
+            self.status_label.setText("Некорректный ответ Ely.by")
+            return
+
+        self.result_data = {
+            "type": "elyby",
+            "email": self.email_input.text().strip(),
+            "username": username,
+            "uuid": uuid_val,
+            "access_token": access_token,
+            "refresh_token": refresh_token or "",
+            "client_token": new_client or "",
+        }
+        self.accept()
+
+
+# ============================================================
 #  DROP ZONE
 # ============================================================
 class DropZone(QLabel):
@@ -2563,7 +2754,6 @@ class DotLauncher(QMainWindow):
         self.instances = {}
         self.current_instance = None
         self.launcher_thread = None
-        self.login_thread = None
         self.refresh_thread = None
         self.import_thread = None
         self.instance_install_thread = None
@@ -2617,32 +2807,22 @@ class DotLauncher(QMainWindow):
         account_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         left_layout.addWidget(account_label)
 
-        self.account_type = QComboBox()
-        self.account_type.addItems(["Offline", "Ely.by"])
-        self.account_type.currentIndexChanged.connect(self.on_account_type_changed)
-        left_layout.addWidget(self.account_type)
+        self.account_combo = QComboBox()
+        self.account_combo.currentIndexChanged.connect(self.on_account_changed)
+        left_layout.addWidget(self.account_combo)
 
-        self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("Никнейм")
-        self.username_input.editingFinished.connect(self.save_account)
-        left_layout.addWidget(self.username_input)
+        acc_btns = QHBoxLayout()
+        acc_btns.setSpacing(4)
 
-        self.email_input = QLineEdit()
-        self.email_input.setPlaceholderText("Email (Ely.by)")
-        self.email_input.setVisible(False)
-        self.email_input.editingFinished.connect(self.save_account)
-        left_layout.addWidget(self.email_input)
+        self.add_account_button = QPushButton("＋ Добавить")
+        self.add_account_button.clicked.connect(self.add_account)
+        acc_btns.addWidget(self.add_account_button)
 
-        self.password_input = QLineEdit()
-        self.password_input.setPlaceholderText("Пароль (Ely.by)")
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.setVisible(False)
-        left_layout.addWidget(self.password_input)
+        self.remove_account_button = QPushButton("Удалить")
+        self.remove_account_button.clicked.connect(self.remove_account)
+        acc_btns.addWidget(self.remove_account_button)
 
-        self.login_button = QPushButton("Войти")
-        self.login_button.setVisible(False)
-        self.login_button.clicked.connect(self.elyby_login)
-        left_layout.addWidget(self.login_button)
+        left_layout.addLayout(acc_btns)
 
         self.login_status = QLabel("")
         self.login_status.setWordWrap(True)
@@ -2796,18 +2976,27 @@ class DotLauncher(QMainWindow):
     def _validate_config(self, cfg):
         if not isinstance(cfg, dict):
             return {}
+        cfg = migrate_accounts_format(cfg)
         out = {}
         if isinstance(cfg.get("workspace"), str) and cfg["workspace"]:
             out["workspace"] = cfg["workspace"]
-        for key in ("username", "email", "elyby_username", "elyby_uuid",
-                    "elyby_access_token", "elyby_refresh_token",
-                    "client_token", "java_path"):
-            v = cfg.get(key)
-            if isinstance(v, str):
-                out[key] = v
+        v = cfg.get("java_path")
+        if isinstance(v, str):
+            out["java_path"] = v
         mem = safe_int(cfg.get("memory_mb"), DEFAULT_MEMORY_MB)
         out["memory_mb"] = max(MIN_MEMORY_MB, min(MAX_MEMORY_MB, mem))
         out["use_managed_java"] = bool(cfg.get("use_managed_java", False))
+
+        accounts = cfg.get("accounts")
+        if isinstance(accounts, list) and accounts:
+            out["accounts"] = accounts
+        else:
+            out["accounts"] = [{"type": "offline", "name": ""}]
+        ai = safe_int(cfg.get("active_account"), 0)
+        if not (0 <= ai < len(out["accounts"])):
+            ai = 0
+        out["active_account"] = ai
+
         return out
 
     def load_config(self):
@@ -2842,8 +3031,8 @@ class DotLauncher(QMainWindow):
             sys.exit(1)
 
         self.config["workspace"] = folder
-        self.config.setdefault("username", "")
-        self.config.setdefault("client_token", str(uuid.uuid4()))
+        self.config.setdefault("accounts", [{"type": "offline", "name": ""}])
+        self.config.setdefault("active_account", 0)
         self.config.setdefault("memory_mb", DEFAULT_MEMORY_MB)
         self.config.setdefault("use_managed_java", False)
         self.save_config()
@@ -2879,18 +3068,11 @@ class DotLauncher(QMainWindow):
 
         self.refresh_instance_list()
 
-        if self.config.get("email"):
-            self.account_type.setCurrentIndex(1)
-            self.email_input.setText(self.config["email"])
-            if self.config.get("elyby_username"):
-                self.username_input.setText(self.config["elyby_username"])
-                self.login_status.setText(
-                    f"Сохранён аккаунт: {self.config['elyby_username']}"
-                )
-            if self.config.get("elyby_refresh_token"):
-                self._try_refresh_elyby()
-        elif self.config.get("username"):
-            self.username_input.setText(self.config["username"])
+        # Профили аккаунтов
+        self.refresh_account_combo()
+        acc = self._active_account()
+        if acc and acc.get("type") == "elyby" and acc.get("refresh_token"):
+            self._refresh_elyby_silent(acc)
 
         if self.config.get("java_path"):
             self.java_status.setText(f"Java: {self.config['java_path']} (вручную)")
@@ -2991,94 +3173,158 @@ class DotLauncher(QMainWindow):
             self.java_status.setText("Java: авто")
         return find_java()
 
-    # ---------- АККАУНТ ----------
-    def on_account_type_changed(self, index):
-        is_elyby = (index == 1)
-        self.username_input.setVisible(not is_elyby)
-        self.email_input.setVisible(is_elyby)
-        self.password_input.setVisible(is_elyby)
-        self.login_button.setVisible(is_elyby)
-        self.save_account()
+    # ---------- АККАУНТЫ ----------
+    def _active_account(self):
+        accounts = self.config.get("accounts", [])
+        idx = safe_int(self.config.get("active_account"), 0)
+        if 0 <= idx < len(accounts):
+            return accounts[idx]
+        return None
 
-    def save_account(self):
-        if self.account_type.currentIndex() == 0:
-            self.config["username"] = self.username_input.text()
+    def refresh_account_combo(self):
+        self.account_combo.blockSignals(True)
+        self.account_combo.clear()
+
+        accounts = self.config.get("accounts", [])
+        for acc in accounts:
+            if acc.get("type") == "offline":
+                name = acc.get("name") or "(без имени)"
+                display = f"{name} [offline]"
+            else:
+                name = acc.get("username") or acc.get("email") or "?"
+                display = f"{name} [Ely.by]"
+            self.account_combo.addItem(display)
+
+        ai = safe_int(self.config.get("active_account"), 0)
+        if 0 <= ai < len(accounts):
+            self.account_combo.setCurrentIndex(ai)
+        self.account_combo.blockSignals(False)
+
+        self.update_login_status()
+
+    def update_login_status(self):
+        acc = self._active_account()
+        if not acc:
+            self.login_status.setText("")
+            return
+        if acc.get("type") == "offline":
+            name = acc.get("name") or "(имя не задано)"
+            self.login_status.setText(f"Offline: {name}")
         else:
-            self.config["email"] = self.email_input.text()
-        self.save_config()
+            self.login_status.setText(
+                f"Ely.by: {acc.get('username', '?')}"
+            )
 
-    def elyby_login(self):
-        email = self.email_input.text().strip()
-        password = self.password_input.text()
-        if not email or not password:
-            self.login_status.setText("Введите email и пароль")
+    def on_account_changed(self, idx):
+        if idx < 0:
+            return
+        self.config["active_account"] = idx
+        self.save_config()
+        self.update_login_status()
+
+        acc = self._active_account()
+        if acc and acc.get("type") == "elyby" and acc.get("refresh_token"):
+            self._refresh_elyby_silent(acc)
+
+    def add_account(self):
+        dlg = AddProfileDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dlg.result_data:
             return
 
-        client_token = self.config.get("client_token") or str(uuid.uuid4())
-        self.config["client_token"] = client_token
+        accounts = self.config.setdefault("accounts", [])
+        accounts.append(dlg.result_data)
+        self.config["active_account"] = len(accounts) - 1
         self.save_config()
+        self.refresh_account_combo()
 
-        self.login_button.setEnabled(False)
-        self.login_status.setText("Авторизация...")
+        data = dlg.result_data
+        name = data.get("name") or data.get("username") or "?"
+        self.log(f"[dotLauncher] Добавлен профиль: {name}")
 
-        self.login_thread = ElybyLoginThread(email, password, client_token)
-        self.login_thread.finished_signal.connect(self.on_elyby_login_finished)
-        self.login_thread.start()
-
-    def on_elyby_login_finished(self, success, data, error):
-        self.password_input.clear()
-        self.login_button.setEnabled(True)
-
-        if not success:
-            self.login_status.setText(f"Ошибка: {error}")
-            self.log(f"[Ошибка] Ely.by: {error}")
+    def remove_account(self):
+        accounts = self.config.get("accounts", [])
+        idx = safe_int(self.config.get("active_account"), 0)
+        if not accounts or not (0 <= idx < len(accounts)):
             return
-
-        access_token = data.get("accessToken")
-        refresh_token = data.get("refreshToken")
-        selected = data.get("selectedProfile", {})
-        uuid_val = selected.get("id")
-        username = selected.get("name")
-        new_client = data.get("clientToken")
-        if new_client:
-            self.config["client_token"] = new_client
-
-        if not access_token or not uuid_val or not username:
-            self.login_status.setText("Некорректный ответ Ely.by")
+        acc = accounts[idx]
+        name = acc.get("name") or acc.get("username") or "?"
+        reply = QMessageBox.question(
+            self, "Удаление профиля",
+            f"Удалить профиль «{name}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
-
-        self.config["elyby_access_token"] = access_token
-        if refresh_token:
-            self.config["elyby_refresh_token"] = refresh_token
-        self.config["elyby_uuid"] = uuid_val
-        self.config["elyby_username"] = username
+        del accounts[idx]
+        if not accounts:
+            accounts.append({"type": "offline", "name": ""})
+        self.config["active_account"] = min(idx, len(accounts) - 1)
         self.save_config()
+        self.refresh_account_combo()
+        self.log(f"[dotLauncher] Профиль «{name}» удалён.")
 
-        self.username_input.setText(username)
-        self.login_status.setText(f"Вошли как {username}")
-        self.log(f"[dotLauncher] Авторизация Ely.by успешна: {username}")
-
-    def _try_refresh_elyby(self):
-        client_token = self.config.get("client_token")
-        access_token = self.config.get("elyby_access_token")
+    def _refresh_elyby_silent(self, acc):
+        """Тихо обновляет токен в фоне, не блокируя UI."""
+        client_token = acc.get("client_token")
+        access_token = acc.get("access_token")
         if not client_token or not access_token:
             return
         self.refresh_thread = ElybyRefreshThread(access_token, client_token)
-        self.refresh_thread.finished_signal.connect(self.on_elyby_refresh_finished)
+        self.refresh_thread.finished_signal.connect(
+            lambda ok, data, err, a=acc: self._on_silent_refresh(ok, data, err, a)
+        )
         self.refresh_thread.start()
 
-    def on_elyby_refresh_finished(self, success, data, error):
+    def _on_silent_refresh(self, success, data, error, acc):
         if not success:
-            self.log(f"[dotLauncher] Не удалось обновить сессию Ely.by: {error}")
+            self.log(f"[dotLauncher] Обновление Ely.by: {error}")
             return
-        access_token = data.get("accessToken")
-        refresh_token = data.get("refreshToken")
-        if access_token:
-            self.config["elyby_access_token"] = access_token
-        if refresh_token:
-            self.config["elyby_refresh_token"] = refresh_token
+        new_token = data.get("accessToken")
+        new_refresh = data.get("refreshToken")
+        if new_token:
+            acc["access_token"] = new_token
+        if new_refresh:
+            acc["refresh_token"] = new_refresh
         self.save_config()
         self.log("[dotLauncher] Сессия Ely.by обновлена.")
+
+    def _refresh_active_elyby_blocking(self):
+        """Синхронный refresh активного Ely.by-профиля перед запуском."""
+        acc = self._active_account()
+        if not acc or acc.get("type") != "elyby":
+            return
+        if not acc.get("refresh_token"):
+            return
+
+        client_token = acc.get("client_token")
+        access_token = acc.get("access_token")
+        if not client_token or not access_token:
+            return
+
+        try:
+            url = "https://authserver.ely.by/auth/refresh"
+            payload = {
+                "accessToken": access_token,
+                "clientToken": client_token,
+                "requestUser": True,
+            }
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code != 200:
+                self.log("[Внимание] Ely.by refresh вернул ошибку.")
+                return
+            data = r.json()
+            new_token = data.get("accessToken")
+            new_refresh = data.get("refreshToken")
+            if new_token:
+                acc["access_token"] = new_token
+            if new_refresh:
+                acc["refresh_token"] = new_refresh
+            self.save_config()
+            self.log("[dotLauncher] Сессия Ely.by обновлена.")
+        except Exception as e:
+            self.log(f"[Внимание] Не удалось обновить сессию Ely.by: {e}")
 
     # ---------- DRAG-AND-DROP / ИМПОРТ ----------
     def handle_dropped_files(self, files):
@@ -3120,7 +3366,6 @@ class DotLauncher(QMainWindow):
         self.import_thread.start()
 
     def import_modpack_dialog(self):
-        """Диалог выбора .zip/.jar для импорта модпака."""
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Выберите модпак, архив или моды для импорта",
@@ -3321,7 +3566,7 @@ class DotLauncher(QMainWindow):
         item = self.instance_list.itemAt(pos)
         menu = QMenu(self)
 
-        # --- Пустая область списка: только создание/импорт ---
+        # --- Пустая область списка ---
         if item is None:
             act_new = menu.addAction("Новая сборка")
             act_import = menu.addAction("Импорт модпака")
@@ -3351,33 +3596,25 @@ class DotLauncher(QMainWindow):
             and self.launcher_thread.isRunning()
         )
 
-        # 1. Играть
         act_play = menu.addAction("Играть")
         act_play.setEnabled(not launcher_running)
 
-        # 2. Развернуть / Свернуть
         if self.current_instance == instance_id and self.mods_expanded:
             act_expand = menu.addAction("Свернуть сборку")
         else:
             act_expand = menu.addAction("Развернуть сборку")
 
-        # 3. Открыть папку сборки
         act_folder = menu.addAction("Открыть папку сборки")
         act_screenshots = menu.addAction("Открыть скриншоты")
-        
+
         menu.addSeparator()
 
-        # 4. Удалить
         act_delete = menu.addAction("Удалить сборку")
         act_delete.setEnabled(not launcher_running)
 
         chosen = menu.exec(self.instance_list.mapToGlobal(pos))
         if chosen is None:
             return
-
-        # Все действия, кроме удаления, требуют, чтобы эта сборка была текущей.
-        if chosen in (act_play, act_expand, act_folder):
-            self._select_instance_by_id(instance_id)
 
         if chosen in (act_play, act_expand, act_folder):
             self._select_instance_by_id(instance_id)
@@ -3421,18 +3658,15 @@ class DotLauncher(QMainWindow):
 
         menu = QMenu(self)
 
-        # 1. Включить / Выключить
         if disabled:
             act_toggle = menu.addAction("Включить мод")
         else:
             act_toggle = menu.addAction("Выключить мод")
 
-        # 2. Открыть расположение файла
         act_open = menu.addAction("Открыть расположение файла")
 
         menu.addSeparator()
 
-        # 3. Удалить
         act_delete = menu.addAction("Удалить мод")
 
         chosen = menu.exec(self.mods_list.mapToGlobal(pos))
@@ -3792,6 +4026,7 @@ class DotLauncher(QMainWindow):
                 self, "Ошибка",
                 f"Не удалось открыть папку:\n{e}"
             )
+
     def open_screenshots_folder(self, instance_id=None):
         iid = instance_id or self.current_instance
         if not iid or iid not in self.instances:
@@ -3881,26 +4116,29 @@ class DotLauncher(QMainWindow):
         loader_id = inst["loader"]
         loader_version = inst.get("loader_version")
 
-        if self.account_type.currentIndex() == 0:
-            username = self.username_input.text().strip()
+        acc = self._active_account()
+        if not acc:
+            self.log("[Ошибка] Нет активного профиля. Добавьте профиль.")
+            return
+
+        if acc.get("type") == "offline":
+            username = (acc.get("name") or "").strip()
             if not username:
-                self.log("[Ошибка] Введите никнейм.")
+                self.log("[Ошибка] В профиле не задан никнейм.")
                 return
             uuid_val = self._offline_uuid(username)
             token = "0" * 32
             elyby = False
         else:
-            if self.config.get("elyby_refresh_token"):
+            if acc.get("refresh_token"):
                 self.log("[dotLauncher] Обновление сессии Ely.by перед запуском...")
-                self._try_refresh_elyby()
-                if self.refresh_thread and self.refresh_thread.isRunning():
-                    self.refresh_thread.wait(15000)
+                self._refresh_active_elyby_blocking()
 
-            username = self.config.get("elyby_username", "")
-            uuid_val = self.config.get("elyby_uuid", "")
-            token = self.config.get("elyby_access_token", "")
+            username = acc.get("username", "")
+            uuid_val = acc.get("uuid", "")
+            token = acc.get("access_token", "")
             if not username or not token:
-                self.log("[Ошибка] Сначала авторизуйтесь в Ely.by.")
+                self.log("[Ошибка] Профиль Ely.by без токена. Пересоздайте профиль.")
                 return
             elyby = True
 
@@ -4034,15 +4272,14 @@ class DotLauncher(QMainWindow):
                 self.launcher_thread.terminate()
                 self.launcher_thread.wait(2000)
 
-        for t in (self.login_thread, self.refresh_thread):
-            if t and t.isRunning():
-                try:
-                    t.finished_signal.disconnect()
-                except Exception:
-                    pass
-                if not t.wait(3000):
-                    t.terminate()
-                    t.wait(1000)
+        if self.refresh_thread and self.refresh_thread.isRunning():
+            try:
+                self.refresh_thread.finished_signal.disconnect()
+            except Exception:
+                pass
+            if not self.refresh_thread.wait(3000):
+                self.refresh_thread.terminate()
+                self.refresh_thread.wait(1000)
 
         event.accept()
 
