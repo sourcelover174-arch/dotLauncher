@@ -2539,6 +2539,10 @@ class ModsListWidget(QListWidget):
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
+        # Только левая кнопка мыши переключает мод.
+        # ПКМ используется для контекстного меню и не должна менять состояние.
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
         index = self.indexAt(event.pos())
         if index.isValid():
             row = index.row()
