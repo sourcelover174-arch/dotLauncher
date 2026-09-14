@@ -1736,11 +1736,12 @@ class InstanceInstallThread(QThread):
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(bool, dict, str)
 
-    def __init__(self, instances_dir, workspace, version, loader_id, name,
-                 java_path=None):
+    def __init__(self, instances_dir, workspace, instance_id, version,
+                 loader_id, name, java_path=None):
         super().__init__()
         self.instances_dir = instances_dir
         self.workspace = workspace
+        self.instance_id = instance_id
         self.version = version
         self.loader_id = loader_id
         self.name = name
@@ -1765,18 +1766,6 @@ class InstanceInstallThread(QThread):
             "setMax": self._cb_max,
         }
 
-    def _new_instance_id(self):
-        existing = set()
-        if os.path.isdir(self.instances_dir):
-            try:
-                existing = set(os.listdir(self.instances_dir))
-            except OSError:
-                pass
-        while True:
-            iid = str(uuid.uuid4())[:8]
-            if iid not in existing:
-                return iid
-
     def run(self):
         try:
             loader_name = MOD_LOADERS.get(self.loader_id, self.loader_id)
@@ -1785,8 +1774,7 @@ class InstanceInstallThread(QThread):
                 f"Minecraft {self.version} + {loader_name}"
             )
 
-            instance_id = self._new_instance_id()
-            instance_dir = os.path.join(self.instances_dir, instance_id)
+            instance_dir = os.path.join(self.instances_dir, self.instance_id)
             minecraft_dir = os.path.join(instance_dir, ".minecraft")
             os.makedirs(minecraft_dir, exist_ok=True)
 
@@ -1798,7 +1786,10 @@ class InstanceInstallThread(QThread):
             )
 
             if self._stop:
-                self.finished_signal.emit(False, {}, "Отменено пользователем")
+                self.finished_signal.emit(
+                    False, {"instance_id": self.instance_id},
+                    "Отменено пользователем"
+                )
                 return
 
             self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
@@ -1834,12 +1825,15 @@ class InstanceInstallThread(QThread):
             )
 
             if self._stop:
-                self.finished_signal.emit(False, {}, "Отменено пользователем")
+                self.finished_signal.emit(
+                    False, {"instance_id": self.instance_id},
+                    "Отменено пользователем"
+                )
                 return
 
             path_rel = os.path.relpath(instance_dir, self.workspace)
             info = {
-                "instance_id": instance_id,
+                "instance_id": self.instance_id,
                 "name": self.name,
                 "version": self.version,
                 "loader": self.loader_id,
@@ -1856,7 +1850,9 @@ class InstanceInstallThread(QThread):
                 self.log_signal.emit(traceback.format_exc())
             except Exception:
                 pass
-            self.finished_signal.emit(False, {}, str(e))
+            self.finished_signal.emit(
+                False, {"instance_id": self.instance_id}, str(e)
+            )
 
     def stop(self):
         self._stop = True
@@ -2525,10 +2521,6 @@ class DropZone(QLabel):
 #  СПИСОК МОДОВ С КЛИКОМ ЛЮБОЙ КНОПКОЙ
 # ============================================================
 class ModsListWidget(QListWidget):
-    """
-    QListWidget, который испускает сигнал modRowClicked с номером строки
-    при клике ЛЮБОЙ кнопкой мыши по элементу списка.
-    """
     modRowClicked = pyqtSignal(int)
 
     def mousePressEvent(self, event):
@@ -2898,6 +2890,9 @@ class DotLauncher(QMainWindow):
         for iid, inst in raw.items():
             if not isinstance(inst, dict):
                 continue
+            # Пропускаем незавершённые установки из прошлых запусков
+            if inst.get("installing"):
+                continue
             name = inst.get("name")
             version = inst.get("version")
             loader = inst.get("loader", "fabric")
@@ -3214,6 +3209,30 @@ class DotLauncher(QMainWindow):
             except Exception:
                 java_path = None
 
+        # Генерируем ID и сразу создаём запись-заглушку,
+        # чтобы сборка сразу появилась в списке с пометкой [СКАЧИВАЕТСЯ].
+        existing = set(self.instances.keys())
+        if os.path.isdir(self.config["instances_dir"]):
+            try:
+                existing.update(os.listdir(self.config["instances_dir"]))
+            except OSError:
+                pass
+        instance_id = str(uuid.uuid4())[:8]
+        while instance_id in existing:
+            instance_id = str(uuid.uuid4())[:8]
+
+        path_rel = os.path.join("instances", instance_id)
+        self.instances[instance_id] = {
+            "name": name,
+            "version": version,
+            "loader": loader_id,
+            "loader_version": None,
+            "path_rel": path_rel,
+            "installing": True,
+        }
+        self.save_instances()
+        self.refresh_instance_list()
+
         self.play_button.setEnabled(False)
         self.delete_button.setEnabled(False)
         self.new_instance_button.setEnabled(False)
@@ -3227,6 +3246,7 @@ class DotLauncher(QMainWindow):
         self.instance_install_thread = InstanceInstallThread(
             self.config["instances_dir"],
             self.config["workspace"],
+            instance_id,
             version,
             loader_id,
             name,
@@ -3247,7 +3267,14 @@ class DotLauncher(QMainWindow):
         self.new_instance_button.setEnabled(True)
         self.status_bar.showMessage("Готов")
 
+        iid = info.get("instance_id") if isinstance(info, dict) else None
+
         if not success:
+            # Удаляем запись-заглушку
+            if iid and iid in self.instances:
+                del self.instances[iid]
+                self.save_instances()
+                self.refresh_instance_list()
             self.log(f"[dotLauncher] Создание сборки не завершено: {error}")
             QMessageBox.warning(
                 self, "Ошибка",
@@ -3255,7 +3282,6 @@ class DotLauncher(QMainWindow):
             )
             return
 
-        iid = info["instance_id"]
         self.instances[iid] = {
             "name": info["name"],
             "version": info["version"],
@@ -3277,6 +3303,13 @@ class DotLauncher(QMainWindow):
         for iid, inst in self.instances.items():
             item = QListWidgetItem(inst["name"])
             item.setData(Qt.ItemDataRole.UserRole, iid)
+            if inst.get("installing"):
+                item.setText(f"{inst['name']}  [СКАЧИВАЕТСЯ]")
+                item.setToolTip("Сборка создаётся, дождитесь завершения.")
+                item.setForeground(QColor("#808080"))
+                f = item.font()
+                f.setItalic(True)
+                item.setFont(f)
             self.instance_list.addItem(item)
 
         if self.current_instance and self.current_instance in self.instances:
@@ -3291,8 +3324,16 @@ class DotLauncher(QMainWindow):
     def on_instance_selected(self, item):
         instance_id = item.data(Qt.ItemDataRole.UserRole)
         if instance_id in self.instances:
-            self.current_instance = instance_id
             inst = self.instances[instance_id]
+            if inst.get("installing"):
+                self.log(
+                    f"[Внимание] Сборка «{inst['name']}» ещё создаётся. "
+                    f"Подождите завершения."
+                )
+                # Возвращаем выделение на текущую сборку
+                self.refresh_instance_list()
+                return
+            self.current_instance = instance_id
             self.instance_name_label.setText(inst["name"])
             loader_name = MOD_LOADERS.get(inst["loader"], inst["loader"])
             ver_text = f"{loader_name} {inst['version']}"
