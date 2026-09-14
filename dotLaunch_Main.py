@@ -3363,7 +3363,8 @@ class DotLauncher(QMainWindow):
 
         # 3. Открыть папку сборки
         act_folder = menu.addAction("Открыть папку сборки")
-
+        act_screenshots = menu.addAction("Открыть скриншоты")
+        
         menu.addSeparator()
 
         # 4. Удалить
@@ -3378,12 +3379,17 @@ class DotLauncher(QMainWindow):
         if chosen in (act_play, act_expand, act_folder):
             self._select_instance_by_id(instance_id)
 
+        if chosen in (act_play, act_expand, act_folder):
+            self._select_instance_by_id(instance_id)
+
         if chosen == act_play:
             self.play_game()
         elif chosen == act_expand:
             self.toggle_expand()
         elif chosen == act_folder:
             self.open_instance_folder()
+        elif chosen == act_screenshots:
+            self.open_screenshots_folder(instance_id)
         elif chosen == act_delete:
             self._select_instance_by_id(instance_id)
             self.delete_instance()
@@ -3781,6 +3787,51 @@ class DotLauncher(QMainWindow):
                 subprocess.Popen(["open", path])
             else:
                 subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Ошибка",
+                f"Не удалось открыть папку:\n{e}"
+            )
+    def open_screenshots_folder(self, instance_id=None):
+        iid = instance_id or self.current_instance
+        if not iid or iid not in self.instances:
+            QMessageBox.information(
+                self, "Нет сборки",
+                "Сначала выберите сборку в списке слева."
+            )
+            return
+
+        inst = self.instances[iid]
+        instance_dir = self._instance_abs_path(inst)
+        screenshots_dir = os.path.join(
+            instance_dir, ".minecraft", "screenshots"
+        )
+
+        if not os.path.isdir(screenshots_dir):
+            reply = QMessageBox.question(
+                self, "Папка не найдена",
+                f"Папки со скриншотами ещё нет:\n{screenshots_dir}\n\n"
+                f"Создать её?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                os.makedirs(screenshots_dir, exist_ok=True)
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Ошибка",
+                    f"Не удалось создать папку:\n{e}"
+                )
+                return
+
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(screenshots_dir)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", screenshots_dir])
+            else:
+                subprocess.Popen(["xdg-open", screenshots_dir])
         except Exception as e:
             QMessageBox.warning(
                 self, "Ошибка",
