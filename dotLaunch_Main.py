@@ -1714,6 +1714,151 @@ class ModpackImportThread(QThread):
 
 
 # ============================================================
+#  НОВЫЙ ПОТОК: ЗАГРУЗКА СПИСКА ВЕРСИЙ MINECRAFT
+# ============================================================
+class VersionFetchThread(QThread):
+    finished_signal = pyqtSignal(bool, list, str)
+
+    def run(self):
+        try:
+            versions = minecraft_launcher_lib.utils.get_version_list()
+            self.finished_signal.emit(True, versions, "")
+        except Exception as e:
+            self.finished_signal.emit(False, [], str(e))
+
+
+# ============================================================
+#  НОВЫЙ ПОТОК: СОЗДАНИЕ ЧИСТОЙ СБОРКИ (без модов)
+# ============================================================
+class InstanceInstallThread(QThread):
+    log_signal = pyqtSignal(str)
+    status_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
+    finished_signal = pyqtSignal(bool, dict, str)
+
+    def __init__(self, instances_dir, workspace, instance_id, version,
+                 loader_id, name, java_path=None):
+        super().__init__()
+        self.instances_dir = instances_dir
+        self.workspace = workspace
+        self.instance_id = instance_id
+        self.version = version
+        self.loader_id = loader_id
+        self.name = name
+        self.java_path = java_path
+        self._stop = False
+        self._progress_max = 0
+
+    def _cb_status(self, text):
+        self.status_signal.emit(text)
+
+    def _cb_progress(self, progress):
+        self.progress_signal.emit(progress, self._progress_max)
+
+    def _cb_max(self, max_progress):
+        self._progress_max = max_progress
+        self.progress_signal.emit(0, max_progress)
+
+    def _make_callback(self):
+        return {
+            "setStatus": self._cb_status,
+            "setProgress": self._cb_progress,
+            "setMax": self._cb_max,
+        }
+
+    def run(self):
+        try:
+            loader_name = MOD_LOADERS.get(self.loader_id, self.loader_id)
+            self.log_signal.emit(
+                f"[dotLauncher] Создание сборки «{self.name}»: "
+                f"Minecraft {self.version} + {loader_name}"
+            )
+
+            instance_dir = os.path.join(self.instances_dir, self.instance_id)
+            minecraft_dir = os.path.join(instance_dir, ".minecraft")
+            os.makedirs(minecraft_dir, exist_ok=True)
+
+            callback = self._make_callback()
+
+            self.log_signal.emit("[dotLauncher] Установка ванильного Minecraft...")
+            minecraft_launcher_lib.install.install_minecraft_version(
+                self.version, minecraft_dir, callback=callback
+            )
+
+            if self._stop:
+                self.finished_signal.emit(
+                    False, {"instance_id": self.instance_id},
+                    "Отменено пользователем"
+                )
+                return
+
+            self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
+            mod_loader = minecraft_launcher_lib.mod_loader.get_mod_loader(
+                self.loader_id
+            )
+
+            try:
+                loader_version = mod_loader.get_latest_loader_version(self.version)
+            except Exception:
+                loader_version = None
+
+            if not loader_version:
+                raise Exception(
+                    f"Не удалось определить версию {loader_name} "
+                    f"для Minecraft {self.version}"
+                )
+
+            self.log_signal.emit(
+                f"[dotLauncher] Версия {loader_name}: {loader_version}"
+            )
+
+            install_kwargs = {}
+            if self.java_path:
+                install_kwargs["java"] = self.java_path
+
+            mod_loader.install(
+                self.version,
+                minecraft_dir,
+                loader_version=loader_version,
+                callback=callback,
+                **install_kwargs,
+            )
+
+            if self._stop:
+                self.finished_signal.emit(
+                    False, {"instance_id": self.instance_id},
+                    "Отменено пользователем"
+                )
+                return
+
+            path_rel = os.path.relpath(instance_dir, self.workspace)
+            info = {
+                "instance_id": self.instance_id,
+                "name": self.name,
+                "version": self.version,
+                "loader": self.loader_id,
+                "loader_version": loader_version,
+                "path_rel": path_rel,
+            }
+            self.log_signal.emit(
+                f"[dotLauncher] Сборка «{self.name}» создана."
+            )
+            self.finished_signal.emit(True, info, "")
+        except Exception as e:
+            self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
+            try:
+                self.log_signal.emit(traceback.format_exc())
+            except Exception:
+                pass
+            self.finished_signal.emit(
+                False, {"instance_id": self.instance_id}, str(e)
+            )
+
+    def stop(self):
+        self._stop = True
+
+
+# ============================================================
 #  ПОТОКИ MODRINTH
 # ============================================================
 class ModrinthSearchThread(QThread):
@@ -2181,6 +2326,162 @@ class ModrinthWindow(QDialog):
 
 
 # ============================================================
+#  НОВОЕ ОКНО: СОЗДАНИЕ СБОРКИ
+# ============================================================
+class NewInstanceDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Создание новой сборки")
+        self.setMinimumSize(680, 560)
+        self.result_data = None
+        self._all_versions = []
+        self._fetch_thread = None
+        self.init_ui()
+        self.load_versions()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        header = QLabel("Создание новой сборки")
+        header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(8)
+
+        # --- Левая колонка: версии ---
+        left = QVBoxLayout()
+        left.setSpacing(4)
+
+        left.addWidget(QLabel("Версия Minecraft:"))
+
+        self.version_list = QListWidget()
+        left.addWidget(self.version_list, 1)
+
+        self.show_snapshots_cb = QCheckBox("Показывать снапшоты")
+        self.show_snapshots_cb.toggled.connect(self._refresh_versions)
+        left.addWidget(self.show_snapshots_cb)
+
+        # --- Правая колонка: настройки ---
+        right = QVBoxLayout()
+        right.setSpacing(4)
+
+        right.addWidget(QLabel("Настройки"))
+
+        right.addSpacing(6)
+        right.addWidget(QLabel("Название сборки:"))
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Моя сборка")
+        right.addWidget(self.name_input)
+
+        right.addSpacing(8)
+        right.addWidget(QLabel("Загрузчик:"))
+        self.loader_combo = QComboBox()
+        self.loader_combo.addItems(["Fabric", "Forge", "NeoForge"])
+        right.addWidget(self.loader_combo)
+
+        right.addStretch()
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        right.addWidget(self.status_label)
+
+        self.create_btn = QPushButton("Создать")
+        self.create_btn.setFixedHeight(28)
+        self.create_btn.clicked.connect(self.on_create)
+        right.addWidget(self.create_btn)
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedHeight(28)
+        cancel_btn.clicked.connect(self.reject)
+        right.addWidget(cancel_btn)
+
+        columns.addLayout(left, 1)
+        columns.addLayout(right, 1)
+        layout.addLayout(columns, 1)
+
+    def load_versions(self):
+        self.version_list.clear()
+        self.version_list.addItem("Загрузка списка версий...")
+        self.version_list.setEnabled(False)
+
+        self._fetch_thread = VersionFetchThread()
+        self._fetch_thread.finished_signal.connect(self.on_versions_loaded)
+        self._fetch_thread.start()
+
+    def on_versions_loaded(self, success, versions, error):
+        self.version_list.setEnabled(True)
+        if not success:
+            self.version_list.clear()
+            self.version_list.addItem(f"Ошибка загрузки: {error}")
+            self.status_label.setText("Не удалось получить список версий.")
+            return
+        self._all_versions = versions
+        self._refresh_versions()
+
+    def _refresh_versions(self):
+        if not self._all_versions:
+            return
+        show_snaps = self.show_snapshots_cb.isChecked()
+        self.version_list.clear()
+        for v in self._all_versions:
+            vtype = v.get("type", "")
+            if not show_snaps and vtype != "release":
+                continue
+            if show_snaps and vtype not in ("release", "snapshot"):
+                continue
+            vid = v.get("id")
+            if not vid:
+                continue
+            self.version_list.addItem(vid)
+
+    def on_create(self):
+        item = self.version_list.currentItem()
+        if item is None:
+            QMessageBox.warning(
+                self, "Версия не выбрана",
+                "Выберите версию Minecraft из списка слева."
+            )
+            return
+        version = item.text()
+        if not version or version.startswith("Загрузка") or version.startswith("Ошибка"):
+            QMessageBox.warning(
+                self, "Версия не выбрана",
+                "Выберите версию Minecraft из списка слева."
+            )
+            return
+
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(
+                self, "Название не введено",
+                "Введите название для новой сборки."
+            )
+            return
+
+        loader_display = self.loader_combo.currentText()
+        loader_id = None
+        for lid, lname in MOD_LOADERS.items():
+            if lname == loader_display:
+                loader_id = lid
+                break
+        if not loader_id:
+            QMessageBox.warning(
+                self, "Ошибка",
+                "Не удалось определить загрузчик."
+            )
+            return
+
+        self.result_data = {
+            "name": name,
+            "version": version,
+            "loader": loader_id,
+        }
+        self.accept()
+
+
+# ============================================================
 #  DROP ZONE
 # ============================================================
 class DropZone(QLabel):
@@ -2220,10 +2521,6 @@ class DropZone(QLabel):
 #  СПИСОК МОДОВ С КЛИКОМ ЛЮБОЙ КНОПКОЙ
 # ============================================================
 class ModsListWidget(QListWidget):
-    """
-    QListWidget, который испускает сигнал modRowClicked с номером строки
-    при клике ЛЮБОЙ кнопкой мыши по элементу списка.
-    """
     modRowClicked = pyqtSignal(int)
 
     def mousePressEvent(self, event):
@@ -2251,6 +2548,7 @@ class DotLauncher(QMainWindow):
         self.login_thread = None
         self.refresh_thread = None
         self.import_thread = None
+        self.instance_install_thread = None
         self.mods_expanded = False
 
         self.config_dir = get_config_dir()
@@ -2370,6 +2668,11 @@ class DotLauncher(QMainWindow):
         instances_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         left_layout.addWidget(instances_label)
 
+        # ---- Кнопка "Новая сборка" (всегда сверху) ----
+        self.new_instance_button = QPushButton("＋ Новая сборка")
+        self.new_instance_button.clicked.connect(self.open_new_instance_dialog)
+        left_layout.addWidget(self.new_instance_button)
+
         self.instance_list = QListWidget()
         self.instance_list.itemClicked.connect(self.on_instance_selected)
         left_layout.addWidget(self.instance_list, 1)
@@ -2395,8 +2698,6 @@ class DotLauncher(QMainWindow):
         self.open_folder_button.clicked.connect(self.open_instance_folder)
         left_layout.addWidget(self.open_folder_button)
 
-        self.modrinth_button = QPushButton("Скачать из Modrinth")
-        
         self.modrinth_button = QPushButton("Скачать из Modrinth")
         self.modrinth_button.clicked.connect(self.open_modrinth_window)
         left_layout.addWidget(self.modrinth_button)
@@ -2589,6 +2890,9 @@ class DotLauncher(QMainWindow):
         for iid, inst in raw.items():
             if not isinstance(inst, dict):
                 continue
+            # Пропускаем незавершённые установки из прошлых запусков
+            if inst.get("installing"):
+                continue
             name = inst.get("name")
             version = inst.get("version")
             loader = inst.get("loader", "fabric")
@@ -2769,6 +3073,9 @@ class DotLauncher(QMainWindow):
         if self.launcher_thread and self.launcher_thread.isRunning():
             self.log("[Ошибка] Дождитесь завершения текущего запуска.")
             return
+        if self.instance_install_thread and self.instance_install_thread.isRunning():
+            self.log("[Ошибка] Идёт создание новой сборки. Дождитесь завершения.")
+            return
 
         relevant = []
         for f in files:
@@ -2869,12 +3176,140 @@ class DotLauncher(QMainWindow):
         self.refresh_instance_list()
         self.log(f"[dotLauncher] Сборка «{info['name']}» добавлена.")
 
+    # ---------- НОВАЯ СБОРКА ----------
+    def open_new_instance_dialog(self):
+        if self.import_thread and self.import_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения импорта.")
+            return
+        if self.launcher_thread and self.launcher_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
+            return
+        if self.instance_install_thread and self.instance_install_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт создание новой сборки.")
+            return
+
+        dlg = NewInstanceDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dlg.result_data:
+            return
+
+        data = dlg.result_data
+        self._start_instance_install(
+            data["name"], data["version"], data["loader"]
+        )
+
+    def _start_instance_install(self, name, version, loader_id):
+        # Разрешаем Java, если пользователь не выбрал managed.
+        java_path = None
+        if not self.managed_java_check.isChecked():
+            try:
+                resolved, _ = self._resolve_java()
+                java_path = resolved
+            except Exception:
+                java_path = None
+
+        # Генерируем ID и сразу создаём запись-заглушку,
+        # чтобы сборка сразу появилась в списке с пометкой [СКАЧИВАЕТСЯ].
+        existing = set(self.instances.keys())
+        if os.path.isdir(self.config["instances_dir"]):
+            try:
+                existing.update(os.listdir(self.config["instances_dir"]))
+            except OSError:
+                pass
+        instance_id = str(uuid.uuid4())[:8]
+        while instance_id in existing:
+            instance_id = str(uuid.uuid4())[:8]
+
+        path_rel = os.path.join("instances", instance_id)
+        self.instances[instance_id] = {
+            "name": name,
+            "version": version,
+            "loader": loader_id,
+            "loader_version": None,
+            "path_rel": path_rel,
+            "installing": True,
+        }
+        self.save_instances()
+        self.refresh_instance_list()
+
+        self.play_button.setEnabled(False)
+        self.delete_button.setEnabled(False)
+        self.new_instance_button.setEnabled(False)
+        self.status_bar.showMessage(f"Создание сборки «{name}»...")
+        self.log(
+            f"[dotLauncher] Создание сборки «{name}»: "
+            f"Minecraft {version}, загрузчик "
+            f"{MOD_LOADERS.get(loader_id, loader_id)}."
+        )
+
+        self.instance_install_thread = InstanceInstallThread(
+            self.config["instances_dir"],
+            self.config["workspace"],
+            instance_id,
+            version,
+            loader_id,
+            name,
+            java_path=java_path,
+        )
+        self.instance_install_thread.log_signal.connect(self.log)
+        self.instance_install_thread.status_signal.connect(
+            self.status_bar.showMessage
+        )
+        self.instance_install_thread.finished_signal.connect(
+            self.on_instance_install_finished
+        )
+        self.instance_install_thread.start()
+
+    def on_instance_install_finished(self, success, info, error):
+        self.play_button.setEnabled(True)
+        self.delete_button.setEnabled(True)
+        self.new_instance_button.setEnabled(True)
+        self.status_bar.showMessage("Готов")
+
+        iid = info.get("instance_id") if isinstance(info, dict) else None
+
+        if not success:
+            # Удаляем запись-заглушку
+            if iid and iid in self.instances:
+                del self.instances[iid]
+                self.save_instances()
+                self.refresh_instance_list()
+            self.log(f"[dotLauncher] Создание сборки не завершено: {error}")
+            QMessageBox.warning(
+                self, "Ошибка",
+                f"Не удалось создать сборку:\n{error}"
+            )
+            return
+
+        self.instances[iid] = {
+            "name": info["name"],
+            "version": info["version"],
+            "loader": info["loader"],
+            "loader_version": info.get("loader_version"),
+            "path_rel": info["path_rel"],
+        }
+        self.save_instances()
+        self.refresh_instance_list()
+        self.log(f"[dotLauncher] Сборка «{info['name']}» создана.")
+        QMessageBox.information(
+            self, "Готово",
+            f"Сборка «{info['name']}» создана."
+        )
+
     # ---------- СПИСОК СБОРОК ----------
     def refresh_instance_list(self):
         self.instance_list.clear()
         for iid, inst in self.instances.items():
             item = QListWidgetItem(inst["name"])
             item.setData(Qt.ItemDataRole.UserRole, iid)
+            if inst.get("installing"):
+                item.setText(f"{inst['name']}  [СКАЧИВАЕТСЯ]")
+                item.setToolTip("Сборка создаётся, дождитесь завершения.")
+                item.setForeground(QColor("#808080"))
+                f = item.font()
+                f.setItalic(True)
+                item.setFont(f)
             self.instance_list.addItem(item)
 
         if self.current_instance and self.current_instance in self.instances:
@@ -2889,8 +3324,16 @@ class DotLauncher(QMainWindow):
     def on_instance_selected(self, item):
         instance_id = item.data(Qt.ItemDataRole.UserRole)
         if instance_id in self.instances:
-            self.current_instance = instance_id
             inst = self.instances[instance_id]
+            if inst.get("installing"):
+                self.log(
+                    f"[Внимание] Сборка «{inst['name']}» ещё создаётся. "
+                    f"Подождите завершения."
+                )
+                # Возвращаем выделение на текущую сборку
+                self.refresh_instance_list()
+                return
+            self.current_instance = instance_id
             self.instance_name_label.setText(inst["name"])
             loader_name = MOD_LOADERS.get(inst["loader"], inst["loader"])
             ver_text = f"{loader_name} {inst['version']}"
@@ -2922,10 +3365,6 @@ class DotLauncher(QMainWindow):
             self.mods_list.clear()
 
     def _populate_mods_list(self):
-        """
-        Полная пересборка списка модов. Вызывается при развороте сборки
-        и при смене выбранной сборки. При клике по моду НЕ вызывается.
-        """
         self.mods_list.clear()
 
         if not self.current_instance or self.current_instance not in self.instances:
@@ -2964,11 +3403,6 @@ class DotLauncher(QMainWindow):
             self.mods_list.addItem(placeholder)
 
     def _make_mod_item(self, filename, disabled):
-        """
-        Создаёт QListWidgetItem с текстом и состоянием, но НЕ добавляет
-        его в список. Используется и при полной пересборке, и при
-        обновлении in place.
-        """
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
@@ -3012,10 +3446,6 @@ class DotLauncher(QMainWindow):
         self.mods_list.addItem(item)
 
     def on_mod_row_clicked(self, row):
-        """
-        Клик по моду. Вместо пересборки всего списка (из-за чего Qt
-        терял элементы) обновляем ТОЛЬКО кликнутый item in place.
-        """
         if not self.current_instance or self.current_instance not in self.instances:
             return
         if row < 0 or row >= self.mods_list.count():
@@ -3065,7 +3495,6 @@ class DotLauncher(QMainWindow):
             self.log(f"[Ошибка] Не удалось переключить мод {filename}: {e}")
             return
 
-        # Обновляем ИМЕННО ЭТОТ item — без clear(), без пересборки списка.
         new_disabled = not disabled
         new_item = self._make_mod_item(target_name, new_disabled)
         item.setText(new_item.text())
@@ -3160,6 +3589,7 @@ class DotLauncher(QMainWindow):
                 self, "Ошибка",
                 f"Не удалось открыть папку:\n{e}"
             )
+
     # ---------- MODRINTH ----------
     def open_modrinth_window(self):
         if not self.current_instance:
@@ -3325,6 +3755,13 @@ class DotLauncher(QMainWindow):
                 self.log("[Внимание] Поток импорта не завершился, принудительное завершение.")
                 self.import_thread.terminate()
                 self.import_thread.wait(2000)
+
+        if self.instance_install_thread and self.instance_install_thread.isRunning():
+            self.instance_install_thread.stop()
+            if not self.instance_install_thread.wait(5000):
+                self.log("[Внимание] Поток создания сборки не завершился, принудительное завершение.")
+                self.instance_install_thread.terminate()
+                self.instance_install_thread.wait(2000)
 
         if self.launcher_thread and self.launcher_thread.isRunning():
             if self.launcher_thread.process is None:
