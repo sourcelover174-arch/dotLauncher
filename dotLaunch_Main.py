@@ -2234,9 +2234,6 @@ class ModrinthWindow(QDialog):
         if self.search_thread and self.search_thread.isRunning():
             return
 
-        self.chosen.clear()
-        self._update_chosen_label()
-
         self.search_status.setText("Поиск...")
         self._clear_results()
 
@@ -2301,6 +2298,8 @@ class ModrinthWindow(QDialog):
 
         btn = QPushButton("Скачать")
         btn.setFixedSize(110, 26)
+        if pid in self.chosen:
+            btn.setText("Добавлено ✓")
 
         def on_click(_checked=False, _pid=pid, _hit=hit, _btn=btn):
             if _pid in self.chosen:
