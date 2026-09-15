@@ -30,19 +30,21 @@
 - **Поиск модов** прямо из лаунчера по названию.
 - Фильтрация по загрузчику и версии Minecraft выбранной сборки.
 - **Автоматическая загрузка зависимостей** — рекурсивно разрешает обязательные зависимости мода.
+- Выбор версии мода
  
 ### Авторизация
 - **Offline** — игра без входа в сеть под любым ником.
 - **Ely.by** — для скинов и минимального аккаунта.
+- Добавление нескольких профилей в лаунчер
 
 ---
 
 ## Скриншоты
 - Интерфейс лаунчера
-<img width="1000" height="715" alt="image" src="https://github.com/user-attachments/assets/d3ff4d14-f6e0-4a71-8b46-55c44d0ca6e3" />
+<img width="995" height="713" alt="Снимок экрана 2026-09-15 154301" src="https://github.com/user-attachments/assets/2c109f8b-62d5-4dda-a268-818df2109ab3" />
 
 - Скачивание через Modrinth
-<img width="1024" height="768" alt="image" src="https://github.com/user-attachments/assets/dcc7b024-f8a6-4ebe-b591-9adc6f9f5464" />
+<img width="954" height="713" alt="Снимок экрана 2026-09-15 154337" src="https://github.com/user-attachments/assets/5c1e386c-7466-4daf-91f6-fdf3e3463788" />
 
 ---
 
