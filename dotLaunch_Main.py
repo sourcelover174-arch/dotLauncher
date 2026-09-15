@@ -104,6 +104,11 @@ SKIP_DIRS = {
     "disabledMods",
 }
 
+# --- Манифест идентификации модов ---
+MANIFEST_DIR_NAME = ".dotlauncher"
+MANIFEST_FILE_NAME = "mods.json"
+MANIFEST_VERSION = 1
+
 APP_ICON_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXA"
     "vmHAAALiUlEQVR4AdRZa4xV1RX+1jlz77yY9wMURn"
@@ -723,6 +728,36 @@ def sha256_file(path):
     return h.hexdigest().lower()
 
 
+def sha1_file(path):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def format_mod_version_label(vdata):
+    """Формирует метку версии с префиксом [БЕТА]/[АЛЬФА] при необходимости."""
+    if not isinstance(vdata, dict):
+        return "?"
+    vtype = (vdata.get("version_type") or "release").strip().lower()
+    prefix = ""
+    if vtype == "beta":
+        prefix = "[БЕТА] "
+    elif vtype == "alpha":
+        prefix = "[АЛЬФА] "
+
+    name = (vdata.get("name") or "").strip()
+    ver_num = (vdata.get("version_number") or "").strip()
+    if not ver_num:
+        ver_num = vdata.get("id", "?")
+    if name and name != ver_num:
+        text = f"{name} ({ver_num})"
+    else:
+        text = ver_num
+    return f"{prefix}{text}"
+
+
 def migrate_accounts_format(cfg):
     """
     Если конфиг в старом формате (единый аккаунт), конвертирует
@@ -1065,6 +1100,211 @@ def read_mod_display_name(jar_path):
 
 
 # ============================================================
+#  ИДЕНТИФИКАЦИЯ МОДОВ (modId + loader)
+# ============================================================
+def _extract_toml_mod_ids(data):
+    """Из распарсенного TOML-файла (mods.toml) вытаскивает список modId."""
+    if not isinstance(data, dict):
+        return []
+    mods = data.get("mods")
+    if not isinstance(mods, list):
+        return []
+    result = []
+    for m in mods:
+        if isinstance(m, dict):
+            mid = m.get("modId")
+            if isinstance(mid, str) and mid.strip():
+                result.append(mid.strip())
+    return result
+
+
+def extract_mod_ids(jar_path):
+    """
+    Возвращает (loader, [mod_ids]) из метаданных jar'а или (None, []).
+    loader — 'fabric' | 'forge' | 'neoforge'.
+    mod_ids — список идентификаторов, которые предоставляет jar.
+    """
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            namelist = zf.namelist()
+
+            # Fabric
+            if "fabric.mod.json" in namelist:
+                data = None
+                try:
+                    with zf.open("fabric.mod.json") as fm:
+                        data = json.load(fm)
+                except Exception:
+                    data = None
+                ids = []
+                if isinstance(data, dict):
+                    mid = data.get("id")
+                    if isinstance(mid, str) and mid.strip():
+                        ids.append(mid.strip())
+                if ids:
+                    return ("fabric", ids)
+
+            # Forge
+            if "META-INF/mods.toml" in namelist and tomllib is not None:
+                data = None
+                try:
+                    with zf.open("META-INF/mods.toml") as fm:
+                        content = fm.read().decode("utf-8", errors="replace")
+                    data = tomllib.loads(content)
+                except Exception:
+                    data = None
+                ids = _extract_toml_mod_ids(data)
+                if ids:
+                    return ("forge", ids)
+
+            # NeoForge
+            if "META-INF/neoforge.mods.toml" in namelist and tomllib is not None:
+                data = None
+                try:
+                    with zf.open("META-INF/neoforge.mods.toml") as fm:
+                        content = fm.read().decode("utf-8", errors="replace")
+                    data = tomllib.loads(content)
+                except Exception:
+                    data = None
+                ids = _extract_toml_mod_ids(data)
+                if ids:
+                    return ("neoforge", ids)
+
+    except Exception:
+        pass
+    return (None, [])
+
+
+# ============================================================
+#  МАНИФЕСТ ИДЕНТИФИКАЦИИ МОДОВ
+# ============================================================
+def get_manifest_path(instance_dir):
+    return os.path.join(instance_dir, MANIFEST_DIR_NAME, MANIFEST_FILE_NAME)
+
+
+def _empty_manifest():
+    return {
+        "version": MANIFEST_VERSION,
+        "mods": {},
+        "by_mod_id": {},
+    }
+
+
+def _rebuild_by_mod_id(manifest):
+    """
+    Строит обратный индекс loader::modId -> filename.
+    Активные моды перезаписывают disabled при коллизии.
+    """
+    by_id = {}
+    mods = manifest.get("mods") or {}
+    if not isinstance(mods, dict):
+        return by_id
+
+    # Сначала disabled, потом активные (активные перезаписывают)
+    for disabled_pass in (True, False):
+        for fn in sorted(mods.keys()):
+            entry = mods.get(fn)
+            if not isinstance(entry, dict):
+                continue
+            if bool(entry.get("disabled", False)) != disabled_pass:
+                continue
+            loader = entry.get("loader")
+            mod_ids = entry.get("mod_ids") or []
+            if not loader or not isinstance(mod_ids, list):
+                continue
+            for mid in mod_ids:
+                if isinstance(mid, str) and mid:
+                    by_id[f"{loader}::{mid}"] = fn
+    return by_id
+
+
+def load_mod_manifest(instance_dir):
+    path = get_manifest_path(instance_dir)
+    if not os.path.isfile(path):
+        return _empty_manifest()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return _empty_manifest()
+    if not isinstance(data, dict):
+        return _empty_manifest()
+
+    manifest = _empty_manifest()
+    mods = data.get("mods")
+    if isinstance(mods, dict):
+        for fn, entry in mods.items():
+            if isinstance(fn, str) and isinstance(entry, dict):
+                manifest["mods"][fn] = entry
+    manifest["by_mod_id"] = _rebuild_by_mod_id(manifest)
+    return manifest
+
+
+def save_mod_manifest(instance_dir, manifest):
+    """Атомарно сохраняет манифест."""
+    path = get_manifest_path(instance_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def build_mod_manifest_entry(jar_path, loader_hint=None, extra=None, disabled=False):
+    """
+    Строит словарь для манифеста на основе данных jar'а.
+    extra — необязательный dict, значения которого вольются поверх.
+    """
+    entry = {
+        "loader": None,
+        "mod_ids": [],
+        "sha1": None,
+        "modrinth": None,
+        "disabled": bool(disabled),
+    }
+
+    loader, mod_ids = extract_mod_ids(jar_path)
+    if loader is None and loader_hint:
+        loader = loader_hint
+    entry["loader"] = loader
+    entry["mod_ids"] = mod_ids
+
+    try:
+        entry["sha1"] = sha1_file(jar_path)
+    except Exception:
+        pass
+
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            entry[k] = v
+
+    return entry
+
+
+def merge_manifest_entry(manifest, filename, entry):
+    """Обновляет/добавляет запись и перестраивает обратный индекс."""
+    if not isinstance(manifest.get("mods"), dict):
+        manifest["mods"] = {}
+    manifest["mods"][filename] = entry
+    manifest["by_mod_id"] = _rebuild_by_mod_id(manifest)
+
+
+def remove_manifest_entry(manifest, filename):
+    """Удаляет запись и перестраивает обратный индекс."""
+    mods = manifest.get("mods")
+    if isinstance(mods, dict):
+        mods.pop(filename, None)
+    manifest["by_mod_id"] = _rebuild_by_mod_id(manifest)
+
+
+# ============================================================
 #  MODRINTH API
 # ============================================================
 def modrinth_session():
@@ -1110,6 +1350,16 @@ def modrinth_get_versions(project_id, loader, mc_version, project_type="mod"):
 def modrinth_get_version_by_id(version_id):
     s = modrinth_session()
     r = s.get(f"{MODRINTH_API}/version/{version_id}", timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def modrinth_get_version_from_hash(file_hash, algorithm="sha1"):
+    s = modrinth_session()
+    r = s.get(
+        f"{MODRINTH_API}/version_file/{file_hash}",
+        params={"algorithm": algorithm}, timeout=20,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -1501,6 +1751,106 @@ class ElybyRefreshThread(QThread):
                 self.finished_signal.emit(False, {}, err)
         except Exception as e:
             self.finished_signal.emit(False, {}, str(e))
+
+
+# ============================================================
+#  ПОТОК: ИНДЕКСАЦИЯ МОДОВ (манифест)
+# ============================================================
+class ModManifestRebuildThread(QThread):
+    """
+    Сканирует mods/ и disabledMods/, извлекает modId+loader+sha1 из каждого jar,
+    опционально запрашивает project_id у Modrinth, сохраняет манифест.
+    """
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str, str)  # ok, error, instance_id
+
+    MAX_MODRINTH_FAILURES = 3
+
+    def __init__(self, instance_id, instance_dir, minecraft_dir,
+                 loader_id, fetch_modrinth=True):
+        super().__init__()
+        self.instance_id = instance_id
+        self.instance_dir = instance_dir
+        self.minecraft_dir = minecraft_dir
+        self.loader_id = loader_id
+        self.fetch_modrinth = fetch_modrinth
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            manifest = _empty_manifest()
+            modrinth_failures = 0
+            total_files = 0
+
+            for sub, disabled in (("mods", False), ("disabledMods", True)):
+                folder = os.path.join(self.minecraft_dir, sub)
+                if not os.path.isdir(folder):
+                    continue
+                try:
+                    names = sorted(os.listdir(folder))
+                except OSError:
+                    continue
+                for fn in names:
+                    if self._stop:
+                        self.finished_signal.emit(
+                            False, "Отменено", self.instance_id
+                        )
+                        return
+                    if not fn.lower().endswith(".jar"):
+                        continue
+                    full = os.path.join(folder, fn)
+                    if not os.path.isfile(full):
+                        continue
+
+                    total_files += 1
+                    entry = build_mod_manifest_entry(
+                        full, loader_hint=self.loader_id, disabled=disabled
+                    )
+
+                    # Опционально уточняем project_id через Modrinth по SHA1
+                    if (self.fetch_modrinth
+                            and entry.get("sha1")
+                            and modrinth_failures < self.MAX_MODRINTH_FAILURES):
+                        try:
+                            vdata = modrinth_get_version_from_hash(
+                                entry["sha1"], "sha1"
+                            )
+                            entry["modrinth"] = {
+                                "project_id": vdata.get("project_id"),
+                                "version_id": vdata.get("id"),
+                                "version_number": vdata.get("version_number"),
+                                "project_title": vdata.get("name"),
+                            }
+                            modrinth_failures = 0
+                        except requests.exceptions.HTTPError as e:
+                            status = (
+                                e.response.status_code
+                                if e.response is not None else None
+                            )
+                            if status != 404:
+                                modrinth_failures += 1
+                        except Exception:
+                            modrinth_failures += 1
+
+                    manifest["mods"][fn] = entry
+
+                    mids = ", ".join(entry.get("mod_ids") or []) or "?"
+                    self.log_signal.emit(
+                        f"[dotLauncher] Индексирован {fn} ({mids})"
+                    )
+
+            manifest["by_mod_id"] = _rebuild_by_mod_id(manifest)
+            save_mod_manifest(self.instance_dir, manifest)
+
+            self.log_signal.emit(
+                f"[dotLauncher] Индекс модов сохранён: {total_files} файл(ов)."
+            )
+            self.finished_signal.emit(True, "", self.instance_id)
+        except Exception as e:
+            self.finished_signal.emit(False, str(e), self.instance_id)
 
 
 # ============================================================
@@ -1962,6 +2312,27 @@ class ModrinthSearchThread(QThread):
             self.finished_signal.emit(False, [], str(e))
 
 
+class ModrinthVersionsThread(QThread):
+    """Загружает список версий проекта."""
+    finished_signal = pyqtSignal(bool, list, str, str)  # ok, versions, error, project_id
+
+    def __init__(self, project_id, loader, mc_version, project_type="mod"):
+        super().__init__()
+        self.project_id = project_id
+        self.loader = loader
+        self.mc_version = mc_version
+        self.project_type = project_type
+
+    def run(self):
+        try:
+            versions = modrinth_get_versions(
+                self.project_id, self.loader, self.mc_version, self.project_type
+            )
+            self.finished_signal.emit(True, versions, "", self.project_id)
+        except Exception as e:
+            self.finished_signal.emit(False, [], str(e), self.project_id)
+
+
 class ModrinthDownloadThread(QThread):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
@@ -1981,27 +2352,38 @@ class ModrinthDownloadThread(QThread):
     def stop(self):
         self._stop = True
 
-    def _resolve_project(self, project_id, to_download, visited):
+    def _resolve_project(self, project_id, version_id, to_download, visited):
         if project_id in visited:
             return
         visited.add(project_id)
 
-        try:
-            versions = modrinth_get_versions(
-                project_id, self.loader, self.mc_version, self.project_type
-            )
-        except Exception as e:
-            self.log_signal.emit(f"[Modrinth] Ошибка получения версий {project_id}: {e}")
-            return
+        v = None
+        if version_id:
+            try:
+                v = modrinth_get_version_by_id(version_id)
+            except Exception as e:
+                self.log_signal.emit(
+                    f"[Modrinth] Ошибка получения версии {version_id}: {e}"
+                )
+                return
+        else:
+            try:
+                versions = modrinth_get_versions(
+                    project_id, self.loader, self.mc_version, self.project_type
+                )
+            except Exception as e:
+                self.log_signal.emit(
+                    f"[Modrinth] Ошибка получения версий {project_id}: {e}"
+                )
+                return
+            if not versions:
+                self.log_signal.emit(
+                    f"[Modrinth] Нет подходящей версии для проекта {project_id} "
+                    f"({self.loader} {self.mc_version})"
+                )
+                return
+            v = versions[0]
 
-        if not versions:
-            self.log_signal.emit(
-                f"[Modrinth] Нет подходящей версии для проекта {project_id} "
-                f"({self.loader} {self.mc_version})"
-            )
-            return
-
-        v = versions[0]
         to_download[project_id] = v
 
         if not self.download_deps:
@@ -2025,7 +2407,7 @@ class ModrinthDownloadThread(QThread):
                 self.log_signal.emit(
                     f"[Modrinth] Зависимость: {dep_pid}"
                 )
-                self._resolve_project(dep_pid, to_download, visited)
+                self._resolve_project(dep_pid, None, to_download, visited)
 
     def _pick_primary_file(self, vdata):
         files = vdata.get("files", []) or []
@@ -2083,7 +2465,10 @@ class ModrinthDownloadThread(QThread):
                 if self._stop:
                     self.finished_signal.emit(False, "Отменено")
                     return
-                self._resolve_project(proj["project_id"], to_download, visited)
+                self._resolve_project(
+                    proj["project_id"], proj.get("version_id"),
+                    to_download, visited
+                )
 
             if not to_download:
                 self.finished_signal.emit(
@@ -2111,6 +2496,21 @@ class ModrinthDownloadThread(QThread):
 
 
 # ============================================================
+#  КЛИКАБЕЛЬНЫЙ ФРЕЙМ (для карточек результатов)
+# ============================================================
+from PyQt6.QtCore import pyqtSignal as _pyqtSignal  # noqa
+
+
+class ClickableFrame(QFrame):
+    clicked = _pyqtSignal()
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
+# ============================================================
 #  ОКНО MODRINTH
 # ============================================================
 class ModrinthWindow(QDialog):
@@ -2124,13 +2524,24 @@ class ModrinthWindow(QDialog):
 
         self.current_type = "mod"
 
+        # chosen: pid -> {"hit": hit, "version_id": str|None, "version_label": str}
         self.chosen = {}
         self._result_cards = []
         self.search_thread = None
         self.download_thread = None
+        self.versions_thread = None
+
+        # Состояние панели версий
+        self.active_project_id = None
+        self.active_hit = None
+        self.active_versions = []
+        self.project_version_ids = {}  # pid -> version_id
+
+        # Был ли скачан хотя бы один мод (для инвалидации манифеста)
+        self.downloaded_mods = False
 
         self.setWindowTitle(f"Modrinth — {instance_name}")
-        self.setMinimumSize(860, 720)
+        self.setMinimumSize(960, 720)
         self.init_ui()
 
     def loader_name(self):
@@ -2201,6 +2612,20 @@ class ModrinthWindow(QDialog):
         self.search_status = QLabel("")
         v.addWidget(self.search_status)
 
+        # Разделитель: слева результаты, справа версии
+        content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        content_splitter.setHandleWidth(3)
+
+        # --- левая колонка: результаты ---
+        results_container = QWidget()
+        rc = QVBoxLayout(results_container)
+        rc.setContentsMargins(0, 0, 0, 0)
+        rc.setSpacing(2)
+
+        results_label = QLabel("Результаты")
+        results_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        rc.addWidget(results_label)
+
         self.results_scroll = QScrollArea()
         self.results_scroll.setWidgetResizable(True)
         self.results_scroll.setFrameShape(QFrame.Shape.StyledPanel)
@@ -2211,7 +2636,37 @@ class ModrinthWindow(QDialog):
         self.results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.results_layout.setSpacing(4)
         self.results_scroll.setWidget(self.results_widget)
-        v.addWidget(self.results_scroll, 1)
+        rc.addWidget(self.results_scroll, 1)
+
+        content_splitter.addWidget(results_container)
+
+        # --- правая колонка: версии ---
+        versions_container = QWidget()
+        vc = QVBoxLayout(versions_container)
+        vc.setContentsMargins(0, 0, 0, 0)
+        vc.setSpacing(2)
+
+        versions_label = QLabel("Версии мода")
+        versions_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        vc.addWidget(versions_label)
+
+        self.versions_info = QLabel("Кликните на мод слева, чтобы увидеть его версии")
+        self.versions_info.setWordWrap(True)
+        vc.addWidget(self.versions_info)
+
+        self.versions_list = QListWidget()
+        self.versions_list.itemSelectionChanged.connect(self._on_version_selected)
+        vc.addWidget(self.versions_list, 1)
+
+        self.versions_status = QLabel("")
+        self.versions_status.setWordWrap(True)
+        vc.addWidget(self.versions_status)
+
+        content_splitter.addWidget(versions_container)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 2)
+
+        v.addWidget(content_splitter, 1)
 
         bottom = QHBoxLayout()
         self.chosen_label = QLabel("Выбрано: 0")
@@ -2286,12 +2741,13 @@ class ModrinthWindow(QDialog):
             self.search_input.setPlaceholderText("Введите название шейдера...")
             self.deps_check.setEnabled(False)
 
-        # Если уже что-то искали — повторим поиск с новым типом
+        # Сбрасываем панель версий — она привязана к текущему типу
+        self._reset_versions_panel()
+
         query = self.search_input.text().strip()
         if query and not (self.search_thread and self.search_thread.isRunning()):
             self.do_search()
         else:
-            # Иначе просто очистим старые результаты
             self.chosen.clear()
             self._update_chosen_label()
             self._clear_results()
@@ -2303,9 +2759,10 @@ class ModrinthWindow(QDialog):
             return
         if self.search_thread and self.search_thread.isRunning():
             return
-            
+
         self.search_status.setText("Поиск...")
         self._clear_results()
+        self._reset_versions_panel()
 
         self.search_thread = ModrinthSearchThread(
             query, self.modrinth_loader(), self.mc_version, self.current_type
@@ -2335,16 +2792,90 @@ class ModrinthWindow(QDialog):
             if w:
                 w.deleteLater()
 
+    def _reset_versions_panel(self):
+        self.active_project_id = None
+        self.active_hit = None
+        self.active_versions = []
+        self.versions_list.clear()
+        self.versions_info.setText("Кликните на мод слева, чтобы увидеть его версии")
+        self.versions_status.setText("")
+
+    # ---------- РАБОТА С ВЕРСИЯМИ ----------
+    def _on_card_clicked(self, pid, hit):
+        if pid == self.active_project_id:
+            return
+        self.active_project_id = pid
+        self.active_hit = hit
+        self.active_versions = []
+        self.versions_list.clear()
+        self.versions_info.setText(
+            f"Версии для: {hit.get('title', pid)}"
+        )
+        self.versions_status.setText("Загрузка версий...")
+
+        if self.versions_thread and self.versions_thread.isRunning():
+            # Отключаемся от предыдущего потока
+            try:
+                self.versions_thread.finished_signal.disconnect()
+            except Exception:
+                pass
+
+        self.versions_thread = ModrinthVersionsThread(
+            pid, self.modrinth_loader(), self.mc_version, self.current_type
+        )
+        self.versions_thread.finished_signal.connect(self._on_versions_loaded)
+        self.versions_thread.start()
+
+    def _on_versions_loaded(self, success, versions, error, project_id):
+        # Игнорируем устаревшие ответы
+        if project_id != self.active_project_id:
+            return
+        if not success:
+            self.versions_status.setText(f"Ошибка загрузки версий: {error}")
+            return
+        if not versions:
+            self.versions_status.setText(
+                "Нет версий для этой конфигурации"
+            )
+            return
+
+        self.active_versions = versions
+        self.versions_status.setText(f"Найдено версий: {len(versions)}")
+        self.versions_list.clear()
+        for vdata in versions:
+            label = format_mod_version_label(vdata)
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, vdata)
+            self.versions_list.addItem(item)
+
+        # Авто-выбор первой версии
+        if self.versions_list.count() > 0:
+            self.versions_list.setCurrentRow(0)
+
+    def _on_version_selected(self):
+        if not self.active_project_id:
+            return
+        items = self.versions_list.selectedItems()
+        if not items:
+            return
+        vdata = items[0].data(Qt.ItemDataRole.UserRole)
+        if isinstance(vdata, dict):
+            vid = vdata.get("id")
+            if vid:
+                self.project_version_ids[self.active_project_id] = vid
+
     def _add_result_card(self, hit):
         pid = hit.get("project_id") or hit.get("slug")
         if not pid:
             return
 
-        card = QFrame()
+        card = ClickableFrame()
         card.setFrameShape(QFrame.Shape.StyledPanel)
         card.setFrameShadow(QFrame.Shadow.Raised)
         card.setStyleSheet("QFrame { background-color: #c0c0c0; }")
         card.setMinimumHeight(80)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+
         h = QHBoxLayout(card)
         h.setContentsMargins(8, 6, 8, 6)
 
@@ -2371,12 +2902,37 @@ class ModrinthWindow(QDialog):
         if pid in self.chosen:
             btn.setText("Добавлено ✓")
 
+        # Клик по карточке — активация и загрузка версий
+        card.clicked.connect(lambda _pid=pid, _hit=hit: self._on_card_clicked(_pid, _hit))
+
         def on_click(_checked=False, _pid=pid, _hit=hit, _btn=btn):
             if _pid in self.chosen:
                 del self.chosen[_pid]
                 _btn.setText("Скачать")
             else:
-                self.chosen[_pid] = _hit
+                # Определяем версию
+                vid = self.project_version_ids.get(_pid)
+                # Если карточка активна и vid не задан, но есть загруженные версии — берём первую
+                if vid is None and _pid == self.active_project_id and self.active_versions:
+                    vid = self.active_versions[0].get("id")
+                    if vid:
+                        self.project_version_ids[_pid] = vid
+
+                label = "(последняя версия)"
+                if vid:
+                    for vdata in self.active_versions:
+                        if vdata.get("id") == vid:
+                            label = format_mod_version_label(vdata)
+                            break
+                    else:
+                        # Возможно, версия хранится от другой карточки — просто покажем ID
+                        label = f"ID: {vid[:8]}…"
+
+                self.chosen[_pid] = {
+                    "hit": _hit,
+                    "version_id": vid,
+                    "version_label": label,
+                }
                 _btn.setText("Добавлено ✓")
             self._update_chosen_label()
 
@@ -2395,10 +2951,15 @@ class ModrinthWindow(QDialog):
             return
 
         self.confirm_list.clear()
-        for pid, hit in self.chosen.items():
+        for pid, entry in self.chosen.items():
+            hit = entry.get("hit", {})
             title = hit.get("title", pid)
             author = hit.get("author", "")
-            item = QListWidgetItem(f"{title} — {author}")
+            ver = entry.get("version_label", "")
+            text = f"{title} — {author}"
+            if ver:
+                text += f"  [{ver}]"
+            item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, pid)
             self.confirm_list.addItem(item)
 
@@ -2418,10 +2979,14 @@ class ModrinthWindow(QDialog):
         if self.download_thread and self.download_thread.isRunning():
             return
 
-        projects = [
-            {"project_id": pid, "title": hit.get("title", pid)}
-            for pid, hit in self.chosen.items()
-        ]
+        projects = []
+        for pid, entry in self.chosen.items():
+            hit = entry.get("hit", {})
+            projects.append({
+                "project_id": pid,
+                "title": hit.get("title", pid),
+                "version_id": entry.get("version_id"),
+            })
         if not projects:
             QMessageBox.information(self, "Пусто", "Список пуст.")
             return
@@ -2461,6 +3026,9 @@ class ModrinthWindow(QDialog):
         self.download_btn.setEnabled(True)
         self.download_btn.setText("Скачать")
         if success:
+            # Если скачивали мод — пометим манифест устаревшим
+            if self.current_type == "mod":
+                self.downloaded_mods = True
             QMessageBox.information(self, "Готово", message)
             self.accept()
         else:
@@ -2469,6 +3037,8 @@ class ModrinthWindow(QDialog):
     def closeEvent(self, event):
         if self.search_thread and self.search_thread.isRunning():
             self.search_thread.wait(2000)
+        if self.versions_thread and self.versions_thread.isRunning():
+            self.versions_thread.wait(2000)
         if self.download_thread and self.download_thread.isRunning():
             reply = QMessageBox.question(
                 self, "Загрузка в процессе",
@@ -2480,6 +3050,583 @@ class ModrinthWindow(QDialog):
                 return
             self.download_thread.stop()
             self.download_thread.wait(3000)
+        event.accept()
+
+
+# ============================================================
+#  ПОТОКИ: ЗАМЕНА ВЕРСИИ МОДА
+# ============================================================
+class ModVersionLookupThread(QThread):
+    """Ищет версию мода на Modrinth по SHA1 файла."""
+    finished_signal = pyqtSignal(bool, dict, str)  # ok, version_data, error
+
+    def __init__(self, file_hash):
+        super().__init__()
+        self.file_hash = file_hash
+
+    def run(self):
+        try:
+            data = modrinth_get_version_from_hash(self.file_hash, "sha1")
+            self.finished_signal.emit(True, data, "")
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                self.finished_signal.emit(
+                    False, {}, "Мод не найден на Modrinth (нет в базе хэшей)."
+                )
+            else:
+                self.finished_signal.emit(False, {}, f"HTTP ошибка: {e}")
+        except Exception as e:
+            self.finished_signal.emit(False, {}, str(e))
+
+
+class ModVersionReplaceThread(QThread):
+    """Скачивает выбранную версию мода и заменяет старый файл."""
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, old_mod_path, version_data, target_dir,
+                 loader, mc_version, download_deps):
+        super().__init__()
+        self.old_mod_path = old_mod_path
+        self.version_data = version_data
+        self.target_dir = target_dir
+        self.loader = loader
+        self.mc_version = mc_version
+        self.download_deps = download_deps
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _pick_primary_file(self, vdata):
+        files = vdata.get("files", []) or []
+        for f in files:
+            if f.get("primary"):
+                return f
+        return files[0] if files else None
+
+    def _download_one(self, vdata, dest_override=None):
+        primary = self._pick_primary_file(vdata)
+        if not primary:
+            raise Exception("У версии нет файлов для скачивания")
+        url = primary.get("url")
+        filename = primary.get("filename") or "mod.jar"
+        if not url:
+            raise Exception("У файла нет URL")
+
+        dest = dest_override or os.path.join(self.target_dir, filename)
+        if dest_override is None and os.path.isfile(dest):
+            self.log_signal.emit(f"Уже установлено: {filename}")
+            return dest
+
+        self.log_signal.emit(f"Скачивание {filename}...")
+        s = modrinth_session()
+        r = s.get(url, stream=True, timeout=120)
+        r.raise_for_status()
+
+        tmp = dest + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if self._stop:
+                        raise Exception("Отменено")
+                    f.write(chunk)
+            os.replace(tmp, dest)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        return dest
+
+    def _collect_deps(self, vdata, to_download, visited):
+        for dep in vdata.get("dependencies", []):
+            if dep.get("dependency_type") != "required":
+                continue
+            dep_pid = dep.get("project_id")
+            dep_vid = dep.get("version_id")
+            if not dep_pid and dep_vid:
+                try:
+                    dv = modrinth_get_version_by_id(dep_vid)
+                    dep_pid = dv.get("project_id")
+                except Exception:
+                    dep_pid = None
+            if not dep_pid or dep_pid in visited:
+                continue
+            visited.add(dep_pid)
+
+            dep_vdata = None
+            if dep_vid:
+                try:
+                    dep_vdata = modrinth_get_version_by_id(dep_vid)
+                except Exception:
+                    dep_vdata = None
+            if dep_vdata is None:
+                try:
+                    versions = modrinth_get_versions(
+                        dep_pid, self.loader, self.mc_version, "mod"
+                    )
+                except Exception:
+                    versions = []
+                if versions:
+                    dep_vdata = versions[0]
+
+            if dep_vdata:
+                to_download[dep_pid] = dep_vdata
+                self._collect_deps(dep_vdata, to_download, visited)
+
+    def run(self):
+        try:
+            files = self.version_data.get("files", []) or []
+            primary = self._pick_primary_file(self.version_data)
+            if not primary:
+                self.finished_signal.emit(False, "У выбранной версии нет файлов")
+                return
+
+            new_filename = primary.get("filename") or "mod.jar"
+            target_path = os.path.join(self.target_dir, new_filename)
+
+            old_abs = os.path.realpath(self.old_mod_path)
+            new_abs = os.path.realpath(target_path)
+            same_file = (old_abs == new_abs)
+
+            # 1. Скачиваем основной файл во временный путь
+            tmp_main = os.path.join(
+                self.target_dir, f".dotlauncher_replace_{uuid.uuid4().hex[:8]}.tmp"
+            )
+            self.log_signal.emit(f"Скачивание {new_filename}...")
+            s = modrinth_session()
+            r = s.get(primary["url"], stream=True, timeout=120)
+            r.raise_for_status()
+            with open(tmp_main, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if self._stop:
+                        raise Exception("Отменено")
+                    f.write(chunk)
+
+            # 2. Собираем и скачиваем зависимости
+            deps_downloaded = 0
+            if self.download_deps:
+                deps = {}
+                self._collect_deps(self.version_data, deps, set())
+                total = len(deps)
+                if total > 0:
+                    self.progress_signal.emit(0, total)
+                for i, (dpid, dvdata) in enumerate(deps.items(), 1):
+                    if self._stop:
+                        raise Exception("Отменено")
+                    try:
+                        self._download_one(dvdata)
+                        deps_downloaded += 1
+                    except Exception as e:
+                        self.log_signal.emit(f"Ошибка загрузки зависимости: {e}")
+                    self.progress_signal.emit(i, total)
+
+            # 3. Удаляем старый файл (если путь отличается)
+            if not same_file and os.path.isfile(self.old_mod_path):
+                try:
+                    os.remove(self.old_mod_path)
+                    self.log_signal.emit(
+                        f"Удалён старый файл: {os.path.basename(self.old_mod_path)}"
+                    )
+                except Exception as e:
+                    self.log_signal.emit(f"Не удалось удалить старый мод: {e}")
+
+            # 4. Перемещаем новый файл на место
+            if os.path.exists(target_path):
+                # Уже был файл с таким именем — перезапишем
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    pass
+            os.replace(tmp_main, target_path)
+            self.log_signal.emit(f"Установлен: {new_filename}")
+
+            msg = f"Мод обновлён до версии: {self.version_data.get('version_number', '?')}"
+            if deps_downloaded:
+                msg += f" (+{deps_downloaded} зависимостей)"
+            self.finished_signal.emit(True, msg)
+
+        except Exception as e:
+            # чистим временный
+            try:
+                if os.path.exists(tmp_main):
+                    os.remove(tmp_main)
+            except Exception:
+                pass
+            self.finished_signal.emit(False, str(e))
+
+
+# ============================================================
+#  ОКНО: ИЗМЕНЕНИЕ ВЕРСИИ МОДА
+# ============================================================
+class ModVersionChangeDialog(QDialog):
+    def __init__(self, instance_dir, mod_path, loader_id, mc_version,
+                 manifest_entry=None, parent=None):
+        super().__init__(parent)
+        self.instance_dir = instance_dir
+        self.mod_path = mod_path
+        self.minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        self.loader_id = loader_id
+        self.mc_version = mc_version
+        self.mod_filename = os.path.basename(mod_path)
+        self.manifest_entry = manifest_entry if isinstance(manifest_entry, dict) else None
+
+        self.project_id = None
+        self.project_title = ""
+        self.current_version_id = None
+        self.current_version_number = ""
+        self.versions = []
+        self.selected_version = None
+
+        self.lookup_thread = None
+        self.versions_thread = None
+        self.replace_thread = None
+
+        self.setWindowTitle(f"Изменить версию — {self.mod_filename}")
+        self.setMinimumSize(620, 600)
+        self.init_ui()
+        self._start_lookup()
+
+    def modrinth_loader(self):
+        return LOADER_TO_MODRINTH.get(self.loader_id, self.loader_id)
+
+    def loader_name(self):
+        return MOD_LOADERS.get(self.loader_id, self.loader_id)
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # Заголовок
+        header_row = QHBoxLayout()
+        header_left = QLabel("Изменение версии мода")
+        header_left.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        header_row.addWidget(header_left)
+
+        self.header_suffix = QLabel(
+            f"для {self.loader_name()} {self.mc_version}"
+        )
+        self.header_suffix.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        header_row.addWidget(self.header_suffix)
+        header_row.addStretch()
+        layout.addLayout(header_row)
+
+        # Информация о моде
+        self.mod_info = QLabel(f"Файл: {self.mod_filename}")
+        self.mod_info.setWordWrap(True)
+        layout.addWidget(self.mod_info)
+
+        self.lookup_status = QLabel("Поиск мода на Modrinth...")
+        self.lookup_status.setWordWrap(True)
+        layout.addWidget(self.lookup_status)
+
+        # Список версий
+        versions_label = QLabel("Доступные версии")
+        versions_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        layout.addWidget(versions_label)
+
+        self.versions_list = QListWidget()
+        self.versions_list.itemSelectionChanged.connect(self._on_version_selected)
+        layout.addWidget(self.versions_list, 1)
+
+        self.versions_status = QLabel("")
+        self.versions_status.setWordWrap(True)
+        layout.addWidget(self.versions_status)
+
+        # Прогресс + лог
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        self.log_area = QTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setFixedHeight(110)
+        self.log_area.setVisible(False)
+        layout.addWidget(self.log_area)
+
+        # Кнопки
+        self.deps_check = QCheckBox("Скачать зависимости выбранной версии")
+        self.deps_check.setChecked(True)
+        layout.addWidget(self.deps_check)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        self.cancel_btn = QPushButton("Отмена")
+        self.cancel_btn.setFixedHeight(26)
+        self.cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(self.cancel_btn)
+
+        self.apply_btn = QPushButton("Применить")
+        self.apply_btn.setFixedHeight(26)
+        self.apply_btn.setEnabled(False)
+        self.apply_btn.clicked.connect(self.on_apply)
+        btns.addWidget(self.apply_btn)
+
+        layout.addLayout(btns)
+
+    # ---------- ПОИСК МОДА ----------
+    def _start_lookup(self):
+        # 1. Если манифест знает project_id — идём напрямую
+        if self.manifest_entry:
+            mr = self.manifest_entry.get("modrinth")
+            if isinstance(mr, dict) and mr.get("project_id"):
+                self.project_id = mr["project_id"]
+                self.project_title = (
+                    mr.get("project_title") or self.mod_filename
+                )
+                self.current_version_id = mr.get("version_id")
+                self.current_version_number = (
+                    mr.get("version_number") or "?"
+                )
+                self.mod_info.setText(
+                    f"Мод: {self.project_title}\n"
+                    f"Текущая версия: {self.current_version_number}"
+                )
+                self.lookup_status.setText(
+                    "Проект известен из индекса. Загрузка списка версий..."
+                )
+                self._load_versions()
+                return
+
+        # 2. Иначе — SHA1 lookup
+        try:
+            file_hash = sha1_file(self.mod_path)
+        except Exception as e:
+            self.lookup_status.setText(f"Не удалось прочитать файл: {e}")
+            return
+
+        self.lookup_status.setText("Поиск мода на Modrinth по хэшу файла...")
+        self.lookup_thread = ModVersionLookupThread(file_hash)
+        self.lookup_thread.finished_signal.connect(self._on_lookup_done)
+        self.lookup_thread.start()
+
+    def _load_versions(self):
+        if not self.project_id:
+            return
+        if self.versions_thread and self.versions_thread.isRunning():
+            try:
+                self.versions_thread.finished_signal.disconnect()
+            except Exception:
+                pass
+        self.versions_thread = ModrinthVersionsThread(
+            self.project_id, self.modrinth_loader(), self.mc_version, "mod"
+        )
+        self.versions_thread.finished_signal.connect(self._on_versions_loaded)
+        self.versions_thread.start()
+
+    def _on_lookup_done(self, success, data, error):
+        if not success:
+            self.lookup_status.setText(f"Ошибка: {error}")
+            return
+
+        self.project_id = data.get("project_id")
+        self.project_title = data.get("name") or self.mod_filename
+        self.current_version_id = data.get("id")
+        self.current_version_number = data.get("version_number", "?")
+
+        self.mod_info.setText(
+            f"Мод: {self.project_title}\n"
+            f"Текущая версия: {self.current_version_number}"
+        )
+        self.lookup_status.setText("Загрузка списка версий...")
+
+        if not self.project_id:
+            self.lookup_status.setText(
+                "Не удалось определить проект на Modrinth."
+            )
+            return
+
+        # Обновим манифест: теперь мы знаем project_id
+        self._update_manifest_with_project_info(
+            project_id=self.project_id,
+            version_id=self.current_version_id,
+            version_number=self.current_version_number,
+            project_title=self.project_title,
+        )
+
+        self._load_versions()
+
+    def _on_versions_loaded(self, success, versions, error, project_id):
+        if project_id != self.project_id:
+            return
+        if not success:
+            self.lookup_status.setText(f"Ошибка загрузки версий: {error}")
+            return
+        if not versions:
+            self.lookup_status.setText(
+                "Нет версий для этой конфигурации сборки."
+            )
+            return
+
+        self.versions = versions
+        self.lookup_status.setText(
+            f"Найдено версий: {len(versions)}. Выберите нужную и нажмите «Применить»."
+        )
+        self.versions_list.clear()
+        for vdata in versions:
+            label = format_mod_version_label(vdata)
+            if vdata.get("id") == self.current_version_id:
+                label = "★ " + label + "  (текущая)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, vdata)
+            self.versions_list.addItem(item)
+
+        # Авто-выбор первой попавшейся не текущей версии
+        if self.versions_list.count() > 0:
+            self.versions_list.setCurrentRow(0)
+
+    def _on_version_selected(self):
+        items = self.versions_list.selectedItems()
+        if not items:
+            self.selected_version = None
+            self.apply_btn.setEnabled(False)
+            return
+        self.selected_version = items[0].data(Qt.ItemDataRole.UserRole)
+        if isinstance(self.selected_version, dict):
+            self.apply_btn.setEnabled(True)
+            # Не даём выбрать ту же самую версию
+            if self.selected_version.get("id") == self.current_version_id:
+                self.apply_btn.setEnabled(False)
+                self.versions_status.setText("Уже установлена эта версия.")
+            else:
+                self.versions_status.setText("")
+        else:
+            self.apply_btn.setEnabled(False)
+
+    # ---------- ОБНОВЛЕНИЕ МАНИФЕСТА ----------
+    def _update_manifest_with_project_info(self, project_id, version_id,
+                                           version_number, project_title):
+        try:
+            manifest = load_mod_manifest(self.instance_dir)
+        except Exception:
+            return
+        entry = manifest.get("mods", {}).get(self.mod_filename)
+        if entry is None:
+            return
+        entry["modrinth"] = {
+            "project_id": project_id,
+            "version_id": version_id,
+            "version_number": version_number,
+            "project_title": project_title,
+        }
+        merge_manifest_entry(manifest, self.mod_filename, entry)
+        try:
+            save_mod_manifest(self.instance_dir, manifest)
+        except Exception:
+            pass
+
+    def _update_manifest_after_replace(self):
+        try:
+            manifest = load_mod_manifest(self.instance_dir)
+        except Exception:
+            return
+
+        # Удаляем старую запись
+        remove_manifest_entry(manifest, self.mod_filename)
+
+        # Определяем новый файл
+        primary = self._pick_primary_file(self.selected_version)
+        new_filename = None
+        if primary:
+            new_filename = primary.get("filename")
+
+        if new_filename:
+            new_path = os.path.join(self.minecraft_dir, "mods", new_filename)
+            if os.path.isfile(new_path):
+                entry = build_mod_manifest_entry(
+                    new_path, loader_hint=self.loader_id
+                )
+                entry["modrinth"] = {
+                    "project_id": self.project_id,
+                    "version_id": self.selected_version.get("id"),
+                    "version_number": self.selected_version.get("version_number"),
+                    "project_title": self.project_title,
+                }
+                merge_manifest_entry(manifest, new_filename, entry)
+
+        try:
+            save_mod_manifest(self.instance_dir, manifest)
+        except Exception:
+            pass
+
+    def _pick_primary_file(self, vdata):
+        if not isinstance(vdata, dict):
+            return None
+        files = vdata.get("files", []) or []
+        for f in files:
+            if f.get("primary"):
+                return f
+        return files[0] if files else None
+
+    # ---------- ПРИМЕНЕНИЕ ----------
+    def on_apply(self):
+        if not self.selected_version:
+            return
+        if self.replace_thread and self.replace_thread.isRunning():
+            return
+
+        target_dir = os.path.join(self.minecraft_dir, "mods")
+        os.makedirs(target_dir, exist_ok=True)
+
+        self.apply_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setValue(0)
+        self.log_area.setVisible(True)
+        self.log_area.clear()
+
+        self.replace_thread = ModVersionReplaceThread(
+            self.mod_path,
+            self.selected_version,
+            target_dir,
+            self.modrinth_loader(),
+            self.mc_version,
+            self.deps_check.isChecked(),
+        )
+        self.replace_thread.log_signal.connect(self.log_area.append)
+        self.replace_thread.progress_signal.connect(self._update_progress)
+        self.replace_thread.finished_signal.connect(self._on_replace_done)
+        self.replace_thread.start()
+
+    def _update_progress(self, current, total):
+        if total > 0:
+            self.progress.setMaximum(total)
+            self.progress.setValue(current)
+        else:
+            self.progress.setMaximum(0)
+
+    def _on_replace_done(self, success, message):
+        self.cancel_btn.setEnabled(True)
+        self.progress.setVisible(False)
+        if success:
+            self._update_manifest_after_replace()
+            QMessageBox.information(self, "Готово", message)
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Ошибка", message)
+            self.apply_btn.setEnabled(True)
+
+    def closeEvent(self, event):
+        if self.lookup_thread and self.lookup_thread.isRunning():
+            self.lookup_thread.wait(2000)
+        if self.versions_thread and self.versions_thread.isRunning():
+            self.versions_thread.wait(2000)
+        if self.replace_thread and self.replace_thread.isRunning():
+            reply = QMessageBox.question(
+                self, "Замена в процессе",
+                "Замена мода ещё не завершена. Прервать и закрыть?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.replace_thread.stop()
+            self.replace_thread.wait(3000)
         event.accept()
 
 
@@ -2831,6 +3978,7 @@ class DotLauncher(QMainWindow):
         self.refresh_thread = None
         self.import_thread = None
         self.instance_install_thread = None
+        self.manifest_rebuild_thread = None
         self.mods_expanded = False
 
         self.config_dir = get_config_dir()
@@ -3180,6 +4328,7 @@ class DotLauncher(QMainWindow):
                 "name": name, "version": version,
                 "loader": loader, "loader_version": loader_version,
                 "path_rel": path_rel,
+                "modsVerIdentified": bool(inst.get("modsVerIdentified", False)),
             }
         return out
 
@@ -3395,6 +4544,107 @@ class DotLauncher(QMainWindow):
         except Exception as e:
             self.log(f"[Внимание] Не удалось обновить сессию Ely.by: {e}")
 
+    # ---------- МАНИФЕСТ МОДОВ ----------
+    def _ensure_manifest_for_current_instance(self):
+        """Если для текущей сборки не проставлен modsVerIdentified — запускает индексацию."""
+        if not self.current_instance or self.current_instance not in self.instances:
+            return
+        inst = self.instances[self.current_instance]
+        if inst.get("modsVerIdentified"):
+            return
+        if self.manifest_rebuild_thread and self.manifest_rebuild_thread.isRunning():
+            return
+        self._start_manifest_rebuild(self.current_instance)
+
+    def _start_manifest_rebuild(self, instance_id):
+        if instance_id not in self.instances:
+            return
+        inst = self.instances[instance_id]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+
+        if not os.path.isdir(minecraft_dir):
+            # Нечего индексировать (сборка ещё не установлена)
+            inst["modsVerIdentified"] = True
+            self.save_instances()
+            return
+
+        loader_id = inst.get("loader", "fabric")
+        self.log(
+            f"[dotLauncher] Индексирование модов сборки «{inst['name']}»..."
+        )
+        self.manifest_rebuild_thread = ModManifestRebuildThread(
+            instance_id, instance_dir, minecraft_dir, loader_id
+        )
+        self.manifest_rebuild_thread.log_signal.connect(self.log)
+        self.manifest_rebuild_thread.finished_signal.connect(
+            self._on_manifest_rebuild_finished
+        )
+        self.manifest_rebuild_thread.start()
+
+    def _on_manifest_rebuild_finished(self, success, error, instance_id):
+        if instance_id in self.instances:
+            inst = self.instances[instance_id]
+            if success:
+                inst["modsVerIdentified"] = True
+                self.save_instances()
+                self.log(
+                    f"[dotLauncher] Моды сборки «{inst['name']}» проиндексированы."
+                )
+            else:
+                self.log(
+                    f"[Внимание] Не удалось проиндексировать моды "
+                    f"сборки «{inst['name']}»: {error}"
+                )
+
+        # Возможно, пользователь уже выбрал другую сборку, которая ещё не проиндексирована
+        if (self.current_instance
+                and self.current_instance != instance_id
+                and self.current_instance in self.instances
+                and not self.instances[self.current_instance].get("modsVerIdentified")):
+            self._ensure_manifest_for_current_instance()
+
+    def _get_or_build_manifest_entry(self, instance_dir, mod_path, filename,
+                                     loader_id, disabled):
+        """
+        Возвращает запись манифеста для файла (с валидацией sha1).
+        Если записи нет или хэш изменился — строит заново и сохраняет.
+        """
+        manifest = load_mod_manifest(instance_dir)
+        entry = manifest.get("mods", {}).get(filename)
+
+        try:
+            actual_sha1 = sha1_file(mod_path)
+        except Exception:
+            actual_sha1 = None
+
+        need_rebuild = False
+        if not isinstance(entry, dict):
+            need_rebuild = True
+        elif (actual_sha1 and entry.get("sha1")
+              and entry["sha1"] != actual_sha1):
+            need_rebuild = True
+        elif entry.get("disabled", False) != bool(disabled):
+            # Синхронизируем флаг, если файл переехал между папками
+            entry["disabled"] = bool(disabled)
+            merge_manifest_entry(manifest, filename, entry)
+            try:
+                save_mod_manifest(instance_dir, manifest)
+            except Exception:
+                pass
+
+        if need_rebuild:
+            entry = build_mod_manifest_entry(
+                mod_path, loader_hint=loader_id, disabled=disabled
+            )
+            merge_manifest_entry(manifest, filename, entry)
+            try:
+                save_mod_manifest(instance_dir, manifest)
+            except Exception:
+                pass
+
+        return entry
+
     # ---------- DRAG-AND-DROP / ИМПОРТ ----------
     def handle_dropped_files(self, files):
         if self.import_thread and self.import_thread.isRunning():
@@ -3510,6 +4760,7 @@ class DotLauncher(QMainWindow):
             "loader": info["loader"],
             "loader_version": info.get("loader_version"),
             "path_rel": info["path_rel"],
+            "modsVerIdentified": False,
         }
         self.save_instances()
         self.refresh_instance_list()
@@ -3565,6 +4816,7 @@ class DotLauncher(QMainWindow):
             "loader_version": None,
             "path_rel": path_rel,
             "installing": True,
+            "modsVerIdentified": False,
         }
         self.save_instances()
         self.refresh_instance_list()
@@ -3621,6 +4873,7 @@ class DotLauncher(QMainWindow):
             "loader": info["loader"],
             "loader_version": info.get("loader_version"),
             "path_rel": info["path_rel"],
+            "modsVerIdentified": False,
         }
         self.save_instances()
         self.refresh_instance_list()
@@ -3730,6 +4983,9 @@ class DotLauncher(QMainWindow):
         else:
             act_toggle = menu.addAction("Выключить мод")
 
+        act_change_version = menu.addAction("Изменить версию")
+        act_change_version.setEnabled(not disabled)
+
         act_open = menu.addAction("Открыть расположение файла")
 
         menu.addSeparator()
@@ -3743,10 +4999,69 @@ class DotLauncher(QMainWindow):
         if chosen == act_toggle:
             row = self.mods_list.row(item)
             self.on_mod_row_clicked(row)
+        elif chosen == act_change_version:
+            self.change_mod_version(filename, disabled)
         elif chosen == act_open:
             self.open_mod_location(filename, disabled)
         elif chosen == act_delete:
             self.delete_mod(filename, disabled)
+
+    def change_mod_version(self, filename, disabled):
+        if not self.current_instance or self.current_instance not in self.instances:
+            return
+        if disabled:
+            QMessageBox.information(
+                self, "Мод выключен",
+                "Сначала включите мод, потом меняйте версию."
+            )
+            return
+        if self.launcher_thread and self.launcher_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
+            return
+
+        # Если идёт индексация — попросим подождать, чтобы не пересекаться
+        if self.manifest_rebuild_thread and self.manifest_rebuild_thread.isRunning():
+            QMessageBox.information(
+                self, "Подождите",
+                "Идёт индексирование модов сборки. Подождите немного\n"
+                "и попробуйте снова."
+            )
+            return
+
+        inst = self.instances[self.current_instance]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        mod_path = os.path.join(minecraft_dir, "mods", filename)
+
+        if not os.path.isfile(mod_path):
+            QMessageBox.warning(
+                self, "Файл не найден",
+                f"Файл мода не найден:\n{mod_path}"
+            )
+            return
+
+        # Достаём/строим запись манифеста
+        entry = self._get_or_build_manifest_entry(
+            instance_dir, mod_path, filename,
+            inst.get("loader", "fabric"), disabled=False
+        )
+
+        dlg = ModVersionChangeDialog(
+            instance_dir, mod_path, inst["loader"], inst["version"],
+            manifest_entry=entry, parent=self
+        )
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted:
+            self.log(
+                f"[dotLauncher] Версия мода «{filename}» изменена."
+            )
+            # Сбрасываем флаг — состав модов изменился
+            if self.current_instance in self.instances:
+                self.instances[self.current_instance]["modsVerIdentified"] = False
+                self.save_instances()
+                self._ensure_manifest_for_current_instance()
+        if self.mods_expanded:
+            self._populate_mods_list()
 
     def open_mod_location(self, filename, disabled):
         if not self.current_instance or self.current_instance not in self.instances:
@@ -3807,6 +5122,15 @@ class DotLauncher(QMainWindow):
                 f"Не удалось удалить файл:\n{e}"
             )
             return
+
+        # Обновляем манифест
+        try:
+            manifest = load_mod_manifest(instance_dir)
+            remove_manifest_entry(manifest, filename)
+            save_mod_manifest(instance_dir, manifest)
+        except Exception:
+            pass
+
         if self.mods_expanded:
             self._populate_mods_list()
 
@@ -3858,6 +5182,9 @@ class DotLauncher(QMainWindow):
             if self.mods_expanded:
                 self._populate_mods_list()
 
+            # Ленивая миграция: если манифест модов ещё не построен — построим
+            self._ensure_manifest_for_current_instance()
+
     # ---------- РАЗВОРОТ СБОРКИ / УПРАВЛЕНИЕ МОДАМИ ----------
     def toggle_expand(self):
         if not self.current_instance:
@@ -3866,6 +5193,7 @@ class DotLauncher(QMainWindow):
         if self.mods_expanded:
             self.mods_list.setVisible(True)
             self._populate_mods_list()
+            self._ensure_manifest_for_current_instance()
         else:
             self.mods_list.setVisible(False)
             self.mods_list.clear()
@@ -3997,6 +5325,19 @@ class DotLauncher(QMainWindow):
             shutil.move(src, target)
             state = "выключен" if not disabled else "включён"
             self.log(f"[dotLauncher] Мод {target_name} {state}.")
+
+            # Синхронизируем манифест с новым состоянием
+            try:
+                manifest = load_mod_manifest(instance_dir)
+                entry = manifest.get("mods", {}).get(filename)
+                if isinstance(entry, dict):
+                    new_entry = dict(entry)
+                    new_entry["disabled"] = bool(not disabled)
+                    manifest["mods"].pop(filename, None)
+                    merge_manifest_entry(manifest, target_name, new_entry)
+                    save_mod_manifest(instance_dir, manifest)
+            except Exception:
+                pass
         except Exception as e:
             self.log(f"[Ошибка] Не удалось переключить мод {filename}: {e}")
             return
@@ -4168,6 +5509,13 @@ class DotLauncher(QMainWindow):
         window.exec()
         self.log(f"[dotLauncher] Modrinth: окно закрыто для «{inst['name']}».")
 
+        # Если были скачаны моды — инвалидируем манифест и запустим переиндексацию
+        if getattr(window, "downloaded_mods", False):
+            if self.current_instance in self.instances:
+                self.instances[self.current_instance]["modsVerIdentified"] = False
+                self.save_instances()
+                self._ensure_manifest_for_current_instance()
+
         if self.mods_expanded:
             self._populate_mods_list()
 
@@ -4312,6 +5660,13 @@ class DotLauncher(QMainWindow):
                 self.log("[Внимание] Поток создания сборки не завершился, принудительное завершение.")
                 self.instance_install_thread.terminate()
                 self.instance_install_thread.wait(2000)
+
+        if self.manifest_rebuild_thread and self.manifest_rebuild_thread.isRunning():
+            self.manifest_rebuild_thread.stop()
+            if not self.manifest_rebuild_thread.wait(5000):
+                self.log("[Внимание] Поток индексации модов не завершился, принудительное завершение.")
+                self.manifest_rebuild_thread.terminate()
+                self.manifest_rebuild_thread.wait(1000)
 
         if self.launcher_thread and self.launcher_thread.isRunning():
             if self.launcher_thread.process is None:
