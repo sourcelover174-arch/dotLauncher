@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 dotLauncher — минималистичный лаунчер Minecraft для Fabric/Forge/NeoForge сборок.
-Один файл, PyQt6 + minecraft-launcher-lib. Поддержка Modrinth.
+Один файл, PyQt6 + minecraft-launcher-lib. Поддержка Modrinth и .mrpack.
 Стилизация: Windows 98.
 """
 
@@ -59,6 +59,14 @@ from PyQt6.QtGui import (
 import minecraft_launcher_lib
 import minecraft_launcher_lib.runtime
 
+# Опциональный модуль .mrpack (доступен в minecraft-launcher-lib 7.2+)
+try:
+    import minecraft_launcher_lib.mrpack as _mrpack_module
+    MRPACK_AVAILABLE = True
+except Exception:
+    _mrpack_module = None
+    MRPACK_AVAILABLE = False
+
 
 # ============================================================
 #  КОНСТАНТЫ
@@ -92,6 +100,21 @@ LOADER_TO_MODRINTH = {
     "fabric": "fabric",
     "forge": "forge",
     "neoforge": "neoforge",
+}
+
+# Соответствие ключей dependencies из modrinth.index.json
+MRPACK_LOADER_KEYS = {
+    "fabric-loader": "fabric",
+    "forge": "forge",
+    "neoforge": "neoforge",
+}
+
+# Известные, но неподдерживаемые загрузчики (для информативного сообщения)
+MRPACK_UNSUPPORTED_KEYS = {
+    "quilt-loader": "Quilt",
+    "rift-loader": "Rift",
+    "liteloader": "LiteLoader",
+    "legacy-fabric": "Legacy Fabric",
 }
 
 MODRINTH_API = "https://api.modrinth.com/v2"
@@ -2055,7 +2078,7 @@ class ModManifestRebuildThread(QThread):
 
 
 # ============================================================
-#  ПОТОК ИМПОРТА МОДПАКА
+#  ПОТОК ИМПОРТА МОДПАКА (jar / zip)
 # ============================================================
 class ModpackImportThread(QThread):
     log_signal = pyqtSignal(str)
@@ -2343,6 +2366,282 @@ class ModpackImportThread(QThread):
             for tmp in self._temp_dirs:
                 shutil.rmtree(tmp, ignore_errors=True)
             self._temp_dirs.clear()
+
+
+# ============================================================
+#  ПОТОК: ИМПОРТ .mrpack
+# ============================================================
+class MrpackImportThread(QThread):
+    """
+    Импорт .mrpack через minecraft-launcher-lib.
+    Последовательно:
+      1. Читает манифест (name, summary, optionalFiles).
+      2. Парсит dependencies (minecraft + fabric-loader/forge/neoforge).
+      3. Спрашивает у пользователя имя и выбор опциональных файлов.
+      4. Вызывает mrpack.install_mrpack — библиотека ставит vanilla MC,
+         загрузчик, скачивает файлы, копирует overrides.
+      5. Возвращает info для регистрации инстанса.
+    """
+    log_signal = pyqtSignal(str)
+    status_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
+    ask_signal = pyqtSignal(dict)  # {default_name, summary, mc_version, loader_display, optional_files}
+    finished_signal = pyqtSignal(bool, dict, str)  # ok, info, error
+
+    def __init__(self, mrpack_path, instances_dir, workspace, existing_ids):
+        super().__init__()
+        self.mrpack_path = mrpack_path
+        self.instances_dir = instances_dir
+        self.workspace = workspace
+        self.existing_ids = set(existing_ids)
+        self._event = threading.Event()
+        self._chosen_name = None
+        self._chosen_optionals = None  # list[str] | None
+        self._cancelled = False
+        self._progress_max = 0
+        self.instance_id = None
+        self.instance_dir = None
+
+    def set_user_choice(self, name, optionals):
+        self._chosen_name = name
+        self._chosen_optionals = optionals
+        self._event.set()
+
+    def cancel(self):
+        self._cancelled = True
+        self._event.set()
+
+    # ---------- callbacks ----------
+    def _cb_status(self, text):
+        self.status_signal.emit(text)
+
+    def _cb_progress(self, progress):
+        self.progress_signal.emit(progress, self._progress_max)
+
+    def _cb_max(self, max_progress):
+        self._progress_max = max_progress
+        self.progress_signal.emit(0, max_progress)
+
+    def _make_callback(self):
+        return {
+            "setStatus": self._cb_status,
+            "setProgress": self._cb_progress,
+            "setMax": self._cb_max,
+        }
+
+    # ---------- helpers ----------
+    def _new_instance_id(self):
+        while True:
+            iid = str(uuid.uuid4())[:8]
+            if iid in self.existing_ids:
+                continue
+            if os.path.exists(os.path.join(self.instances_dir, iid)):
+                continue
+            return iid
+
+    def _read_index_json(self):
+        """Возвращает распарсенный modrinth.index.json из .mrpack."""
+        with zipfile.ZipFile(self.mrpack_path, "r") as zf:
+            try:
+                with zf.open("modrinth.index.json") as f:
+                    raw = f.read().decode("utf-8", errors="replace")
+            except KeyError:
+                return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def _parse_loader_from_dependencies(self, deps):
+        """
+        Возвращает (loader_id, loader_version, unsupported_label).
+        unsupported_label != None, если загрузчик известен, но не поддерживается.
+        """
+        if not isinstance(deps, dict):
+            return ("vanilla", None, None)
+        for key, lid in MRPACK_LOADER_KEYS.items():
+            if key in deps:
+                ver = deps.get(key)
+                if isinstance(ver, str) and ver:
+                    return (lid, ver, None)
+                return (lid, None, None)
+        for key, label in MRPACK_UNSUPPORTED_KEYS.items():
+            if key in deps:
+                return (None, None, label)
+        return ("vanilla", None, None)
+
+    def _cleanup_failed(self):
+        if self.instance_dir and os.path.isdir(self.instance_dir):
+            try:
+                shutil.rmtree(self.instance_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    # ---------- run ----------
+    def run(self):
+        try:
+            if not MRPACK_AVAILABLE:
+                self.finished_signal.emit(
+                    False, {},
+                    "Модуль .mrpack недоступен в установленной версии "
+                    "minecraft-launcher-lib. Обновите библиотеку."
+                )
+                return
+
+            if not os.path.isfile(self.mrpack_path):
+                self.finished_signal.emit(
+                    False, {}, f"Файл не найден: {self.mrpack_path}"
+                )
+                return
+
+            self.log_signal.emit(
+                f"[dotLauncher] Чтение .mrpack: "
+                f"{os.path.basename(self.mrpack_path)}"
+            )
+
+            # 1. Прочитать манифест
+            index = self._read_index_json()
+            if index is None:
+                self.finished_signal.emit(
+                    False, {}, "Некорректный .mrpack: нет modrinth.index.json"
+                )
+                return
+
+            deps = index.get("dependencies") or {}
+            mc_version = deps.get("minecraft")
+            if not mc_version or not isinstance(mc_version, str):
+                self.finished_signal.emit(
+                    False, {}, "В манифесте не указана версия Minecraft"
+                )
+                return
+
+            loader_id, loader_version, unsupported = (
+                self._parse_loader_from_dependencies(deps)
+            )
+            if unsupported:
+                self.finished_signal.emit(
+                    False, {},
+                    f"Загрузчик {unsupported} не поддерживается dotLauncher. "
+                    f"Установите этот модпак вручную или используйте "
+                    f"версию для Fabric/Forge/NeoForge."
+                )
+                return
+
+            # Пробуем получить человекочитаемые name/summary/optional
+            default_name = index.get("name") or "Imported Modpack"
+            summary = index.get("summary") or ""
+            optional_files = []
+            try:
+                info = _mrpack_module.get_mrpack_information(self.mrpack_path)
+                if isinstance(info, dict):
+                    default_name = info.get("name") or default_name
+                    summary = info.get("summary") or summary
+                    optional = info.get("optionalFiles")
+                    if isinstance(optional, list):
+                        optional_files = [
+                            str(x) for x in optional if isinstance(x, str)
+                        ]
+            except Exception as e:
+                self.log_signal.emit(
+                    f"[Внимание] get_mrpack_information: {e}, "
+                    f"использую данные из index.json."
+                )
+
+            loader_display = MOD_LOADERS.get(loader_id, loader_id)
+            self.log_signal.emit(
+                f"[dotLauncher] Модпак: {default_name} | "
+                f"MC {mc_version} | {loader_display} "
+                f"{loader_version or ''}".rstrip()
+            )
+
+            # 2. Спросить у пользователя
+            self.ask_signal.emit({
+                "default_name": default_name,
+                "summary": summary,
+                "mc_version": mc_version,
+                "loader_display": loader_display,
+                "loader_version": loader_version or "",
+                "optional_files": optional_files,
+            })
+            self._event.wait()
+            self._event.clear()
+
+            if self._cancelled or not self._chosen_name:
+                self.finished_signal.emit(False, {}, "Отменено пользователем")
+                return
+
+            name = sanitize_instance_name(self._chosen_name)
+            selected_optionals = self._chosen_optionals or []
+
+            # 3. Готовим instance dir
+            self.instance_id = self._new_instance_id()
+            self.instance_dir = os.path.join(
+                self.instances_dir, self.instance_id
+            )
+            minecraft_dir = os.path.join(self.instance_dir, ".minecraft")
+            os.makedirs(minecraft_dir, exist_ok=True)
+
+            callback = self._make_callback()
+
+            # 4. Строим mrpack_install_options для выбранных опциональных
+            install_options = {}
+            if optional_files:
+                selected_set = set(selected_optionals)
+                for opt in optional_files:
+                    install_options[opt] = (opt in selected_set)
+
+            # 5. Устанавливаем через mrpack.install_mrpack
+            self.log_signal.emit(
+                "[dotLauncher] Установка модпака (Minecraft + загрузчик + файлы)..."
+            )
+            try:
+                _mrpack_module.install_mrpack(
+                    self.mrpack_path,
+                    minecraft_dir,
+                    modpack_directory=None,
+                    callback=callback,
+                    mrpack_install_options=install_options,
+                )
+            except Exception as e:
+                self.log_signal.emit(
+                    f"[Ошибка] install_mrpack: {type(e).__name__}: {e}"
+                )
+                try:
+                    self.log_signal.emit(traceback.format_exc())
+                except Exception:
+                    pass
+                self._cleanup_failed()
+                self.finished_signal.emit(False, {}, str(e))
+                return
+
+            if self._cancelled:
+                self._cleanup_failed()
+                self.finished_signal.emit(False, {}, "Отменено пользователем")
+                return
+
+            # 6. Регистрируем результат
+            path_rel = os.path.relpath(self.instance_dir, self.workspace)
+            info = {
+                "instance_id": self.instance_id,
+                "name": name,
+                "version": mc_version,
+                "loader": loader_id,
+                "loader_version": loader_version,
+                "path_rel": path_rel,
+            }
+            self.log_signal.emit(
+                f"[dotLauncher] Модпак «{name}» установлен."
+            )
+            self.finished_signal.emit(True, info, "")
+
+        except Exception as e:
+            self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
+            try:
+                self.log_signal.emit(traceback.format_exc())
+            except Exception:
+                pass
+            self._cleanup_failed()
+            self.finished_signal.emit(False, {}, str(e))
 
 
 # ============================================================
@@ -4012,6 +4311,126 @@ class InstanceJavaDialog(QDialog):
 
 
 # ============================================================
+#  ОКНО: ПОДТВЕРЖДЕНИЕ ИМПОРТА .mrpack
+# ============================================================
+class MrpackConfirmDialog(QDialog):
+    """
+    Диалог подтверждения импорта .mrpack.
+    Показывает информацию о модпаке, поле имени сборки и выбор
+    опциональных файлов.
+    """
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info if isinstance(info, dict) else {}
+        self.result_data = None  # {"name": str, "optionals": [str, ...]}
+
+        self.setWindowTitle("Импорт модпака (.mrpack)")
+        self.setMinimumSize(560, 480)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        header = QLabel("Установка модпака Modrinth")
+        header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        summary = self.info.get("summary") or ""
+        if summary:
+            summary_label = QLabel(summary)
+            summary_label.setWordWrap(True)
+            layout.addWidget(summary_label)
+
+        info_text = (
+            f"Minecraft: {self.info.get('mc_version', '?')}   |   "
+            f"Загрузчик: {self.info.get('loader_display', '?')}"
+        )
+        lv = self.info.get("loader_version") or ""
+        if lv:
+            info_text += f" {lv}"
+        version_label = QLabel(info_text)
+        version_label.setStyleSheet("color: #404040;")
+        layout.addWidget(version_label)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+
+        # Имя сборки
+        layout.addWidget(QLabel("Название сборки:"))
+        self.name_input = QLineEdit()
+        default_name = self.info.get("default_name") or "Imported Modpack"
+        self.name_input.setText(default_name)
+        self.name_input.selectAll()
+        layout.addWidget(self.name_input)
+
+        # Опциональные файлы
+        optional_files = self.info.get("optional_files") or []
+        layout.addWidget(QLabel(f"Опциональные файлы ({len(optional_files)}):"))
+
+        self.optionals_scroll = QScrollArea()
+        self.optionals_scroll.setWidgetResizable(True)
+        self.optionals_scroll.setFrameShape(QFrame.Shape.StyledPanel)
+        self.optionals_scroll.setFrameShadow(QFrame.Shadow.Sunken)
+
+        self.optionals_widget = QWidget()
+        self.optionals_widget.setStyleSheet("background-color: #ffffff;")
+        self.optionals_layout = QVBoxLayout(self.optionals_widget)
+        self.optionals_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self.optional_checkboxes = []
+        if optional_files:
+            for path in optional_files:
+                cb = QCheckBox(path)
+                cb.setChecked(False)
+                self.optional_checkboxes.append((path, cb))
+                self.optionals_layout.addWidget(cb)
+        else:
+            placeholder = QLabel("— нет опциональных файлов —")
+            placeholder.setStyleSheet("color: #808080;")
+            self.optionals_layout.addWidget(placeholder)
+
+        self.optionals_scroll.setWidget(self.optionals_widget)
+        layout.addWidget(self.optionals_scroll, 1)
+
+        # Кнопки
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedHeight(26)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("Установить")
+        ok_btn.setFixedHeight(26)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.on_ok)
+        btns.addWidget(ok_btn)
+
+        layout.addLayout(btns)
+
+    def on_ok(self):
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(
+                self, "Ошибка", "Введите название сборки."
+            )
+            return
+        selected = [
+            path for path, cb in self.optional_checkboxes if cb.isChecked()
+        ]
+        self.result_data = {
+            "name": name,
+            "optionals": selected,
+        }
+        self.accept()
+
+
+# ============================================================
 #  ОКНО: СОЗДАНИЕ СБОРКИ
 # ============================================================
 class NewInstanceDialog(QDialog):
@@ -4498,6 +4917,7 @@ class DotLauncher(QMainWindow):
         self.launcher_thread = None
         self.refresh_thread = None
         self.import_thread = None
+        self.mrpack_import_thread = None
         self.instance_install_thread = None
         self.manifest_rebuild_thread = None
         self.mods_expanded = False
@@ -4657,9 +5077,9 @@ class DotLauncher(QMainWindow):
 
         self.drop_zone = DropZone(self)
         self.drop_zone.setText(
-            "Перетащи сюда .jar файлы модов, папку модпака\n"
-            "или .zip-архив, чтобы создать сборку dotLauncher\n\n"
-            "Поддерживаются Fabric, Forge и NeoForge"
+            "Перетащи сюда .jar файлы модов, папку модпака,\n"
+            ".zip-архив или .mrpack — чтобы создать сборку\n\n"
+            "Поддерживаются Fabric, Forge и NeoForge, а также .mrpack Modrinth"
         )
         self.drop_zone.filesDropped.connect(self.handle_dropped_files)
         center_layout.addWidget(self.drop_zone, 1)
@@ -5254,8 +5674,15 @@ class DotLauncher(QMainWindow):
         return entry
 
     # ---------- DRAG-AND-DROP / ИМПОРТ ----------
+    def _any_import_running(self):
+        return (
+            (self.import_thread is not None and self.import_thread.isRunning())
+            or (self.mrpack_import_thread is not None
+                and self.mrpack_import_thread.isRunning())
+        )
+
     def handle_dropped_files(self, files):
-        if self.import_thread and self.import_thread.isRunning():
+        if self._any_import_running():
             self.log("[Ошибка] Импорт уже выполняется.")
             return
         if self.launcher_thread and self.launcher_thread.isRunning():
@@ -5265,8 +5692,34 @@ class DotLauncher(QMainWindow):
             self.log("[Ошибка] Идёт создание новой сборки. Дождитесь завершения.")
             return
 
-        relevant = []
+        mrpack_files = []
+        other_files = []
         for f in files:
+            if os.path.isfile(f) and f.lower().endswith(".mrpack"):
+                mrpack_files.append(f)
+            else:
+                other_files.append(f)
+
+        if mrpack_files:
+            # Обрабатываем только первый .mrpack; остальные — с предупреждением
+            if len(mrpack_files) > 1:
+                self.log(
+                    f"[Внимание] Обнаружено {len(mrpack_files)} .mrpack. "
+                    f"Обрабатывается только первый."
+                )
+                for extra in mrpack_files[1:]:
+                    self.log(f"[dotLauncher] Пропущен: {os.path.basename(extra)}")
+            self._start_mrpack_import(mrpack_files[0])
+            if other_files:
+                self.log(
+                    "[Внимание] Остальные файлы из drop проигнорированы — "
+                    "сначала завершите импорт .mrpack."
+                )
+            return
+
+        # Обычный импорт
+        relevant = []
+        for f in other_files:
             if os.path.isdir(f):
                 relevant.append(f)
             elif os.path.isfile(f):
@@ -5275,7 +5728,7 @@ class DotLauncher(QMainWindow):
                     relevant.append(f)
 
         if not relevant:
-            self.log("[Ошибка] Нет .jar, .zip или папок для обработки.")
+            self.log("[Ошибка] Нет .jar, .zip, .mrpack или папок для обработки.")
             return
 
         self.play_button.setEnabled(False)
@@ -5302,6 +5755,113 @@ class DotLauncher(QMainWindow):
         if not files:
             return
         self.handle_dropped_files(files)
+
+    def import_mrpack_dialog(self):
+        if not MRPACK_AVAILABLE:
+            QMessageBox.warning(
+                self, "Недоступно",
+                "Импорт .mrpack недоступен: установленная версия "
+                "minecraft-launcher-lib не содержит модуль mrpack.\n\n"
+                "Обновите библиотеку: pip install -U minecraft-launcher-lib"
+            )
+            return
+        if self._any_import_running():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения текущего импорта.")
+            return
+        if self.launcher_thread and self.launcher_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
+            return
+        if self.instance_install_thread and self.instance_install_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт создание новой сборки.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите модпак .mrpack",
+            "",
+            "Modrinth Modpack (*.mrpack);;Все файлы (*)",
+        )
+        if not path:
+            return
+        self._start_mrpack_import(path)
+
+    def _start_mrpack_import(self, mrpack_path):
+        if not MRPACK_AVAILABLE:
+            QMessageBox.warning(
+                self, "Недоступно",
+                "Импорт .mrpack недоступен: обновите minecraft-launcher-lib."
+            )
+            return
+        self.play_button.setEnabled(False)
+        self.new_instance_button.setEnabled(False)
+        self.status_bar.showMessage("Импорт .mrpack...")
+
+        self.mrpack_import_thread = MrpackImportThread(
+            mrpack_path,
+            self.config["instances_dir"],
+            self.config["workspace"],
+            self.instances.keys(),
+        )
+        self.mrpack_import_thread.log_signal.connect(self.log)
+        self.mrpack_import_thread.status_signal.connect(
+            self.status_bar.showMessage
+        )
+        self.mrpack_import_thread.progress_signal.connect(self.update_progress)
+        self.mrpack_import_thread.ask_signal.connect(self.on_mrpack_ask)
+        self.mrpack_import_thread.finished_signal.connect(self.on_mrpack_finished)
+        self.mrpack_import_thread.start()
+
+    def on_mrpack_ask(self, info):
+        thread = self.mrpack_import_thread
+        if thread is None:
+            return
+
+        self.progress_bar.setVisible(False)
+
+        dlg = MrpackConfirmDialog(info, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            thread.cancel()
+            return
+        if not dlg.result_data:
+            thread.cancel()
+            return
+
+        thread.set_user_choice(
+            dlg.result_data.get("name", ""),
+            dlg.result_data.get("optionals", []),
+        )
+
+    def on_mrpack_finished(self, success, info, error):
+        self.play_button.setEnabled(True)
+        self.new_instance_button.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage("Готов")
+
+        if not success:
+            if error:
+                self.log(f"[dotLauncher] Импорт .mrpack не завершён: {error}")
+            return
+
+        if not isinstance(info, dict):
+            self.log("[Ошибка] Импорт .mrpack вернул некорректные данные.")
+            return
+
+        iid = info.get("instance_id")
+        if not iid:
+            self.log("[Ошибка] Импорт .mrpack: нет instance_id.")
+            return
+
+        self.instances[iid] = {
+            "name": info.get("name", "Imported Modpack"),
+            "version": info.get("version", ""),
+            "loader": info.get("loader", VANILLA_LOADER_ID),
+            "loader_version": info.get("loader_version"),
+            "path_rel": info.get("path_rel", os.path.join("instances", iid)),
+            "modsVerIdentified": False,
+        }
+        self.save_instances()
+        self.refresh_instance_list()
+        self.log(f"[dotLauncher] Сборка «{info.get('name')}» добавлена из .mrpack.")
 
     def on_import_ask(self, versions, loaders):
         thread = self.import_thread
@@ -5376,7 +5936,7 @@ class DotLauncher(QMainWindow):
 
     # ---------- НОВАЯ СБОРКА ----------
     def open_new_instance_dialog(self):
-        if self.import_thread and self.import_thread.isRunning():
+        if self._any_import_running():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения импорта.")
             return
         if self.launcher_thread and self.launcher_thread.isRunning():
@@ -5498,7 +6058,13 @@ class DotLauncher(QMainWindow):
 
         if item is None:
             act_new = menu.addAction("Новая сборка")
-            act_import = menu.addAction("Импорт модпака")
+            act_import = menu.addAction("Импорт модпака (.zip / .jar)")
+            act_import_mrpack = menu.addAction("Импорт .mrpack...")
+            if not MRPACK_AVAILABLE:
+                act_import_mrpack.setEnabled(False)
+                act_import_mrpack.setToolTip(
+                    "Требуется minecraft-launcher-lib с модулем mrpack."
+                )
             chosen = menu.exec(self.instance_list.mapToGlobal(pos))
             if chosen is None:
                 return
@@ -5506,6 +6072,8 @@ class DotLauncher(QMainWindow):
                 self.open_new_instance_dialog()
             elif chosen == act_import:
                 self.import_modpack_dialog()
+            elif chosen == act_import_mrpack:
+                self.import_mrpack_dialog()
             return
 
         instance_id = item.data(Qt.ItemDataRole.UserRole)
@@ -6103,7 +6671,7 @@ class DotLauncher(QMainWindow):
         if self.launcher_thread and self.launcher_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
             return
-        if self.import_thread and self.import_thread.isRunning():
+        if self._any_import_running():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения импорта.")
             return
 
@@ -6303,6 +6871,13 @@ class DotLauncher(QMainWindow):
                 self.log("[Внимание] Поток импорта не завершился, принудительное завершение.")
                 self.import_thread.terminate()
                 self.import_thread.wait(2000)
+
+        if self.mrpack_import_thread and self.mrpack_import_thread.isRunning():
+            self.mrpack_import_thread.cancel()
+            if not self.mrpack_import_thread.wait(5000):
+                self.log("[Внимание] Поток импорта .mrpack не завершился, принудительное завершение.")
+                self.mrpack_import_thread.terminate()
+                self.mrpack_import_thread.wait(2000)
 
         if self.instance_install_thread and self.instance_install_thread.isRunning():
             self.instance_install_thread.stop()
