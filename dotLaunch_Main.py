@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QLabel, QListWidget, QListWidgetItem, QPushButton, QLineEdit,
     QComboBox, QTextEdit, QFileDialog, QInputDialog, QMessageBox,
     QSplitter, QFrame, QProgressBar, QSpinBox, QCheckBox,
-    QDialog, QStackedWidget, QScrollArea, QMenu,
+    QDialog, QStackedWidget, QScrollArea, QMenu, QRadioButton,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QStandardPaths,
@@ -515,6 +515,34 @@ QCheckBox::indicator:checked:disabled {
     background-color: #808080;
 }
 
+QRadioButton {
+    color: #000000;
+    spacing: 6px;
+    background-color: transparent;
+    padding: 2px 0;
+}
+QRadioButton::indicator {
+    width: 12px;
+    height: 12px;
+    background-color: #ffffff;
+    border-top: 2px solid #404040;
+    border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff;
+    border-right: 2px solid #ffffff;
+    border-radius: 7px;
+}
+QRadioButton::indicator:checked {
+    background-color: #000080;
+    border-top: 2px solid #404040;
+    border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff;
+    border-right: 2px solid #ffffff;
+    border-radius: 7px;
+}
+QRadioButton::indicator:disabled {
+    background-color: #c0c0c0;
+}
+
 QProgressBar {
     background-color: #c0c0c0;
     color: #000000;
@@ -849,6 +877,59 @@ def get_java_major(java_path):
         return major
     except Exception:
         return None
+
+
+def _fallback_java_for_mc(mc_version):
+    """
+    Fallback-таблица: для старых версий, где в JSON нет majorVersion.
+    Возвращает целое число или None.
+    """
+    if not mc_version:
+        return None
+    m = re.match(r'^1\.(\d+)(?:\.(\d+))?', str(mc_version))
+    if not m:
+        # Снапшоты и прочее — не берёмся угадывать
+        return None
+    try:
+        minor = int(m.group(1))
+        patch = int(m.group(2)) if m.group(2) else 0
+    except (TypeError, ValueError):
+        return None
+    if minor <= 16:
+        return 8
+    if minor == 17:
+        return 16
+    if minor in (18, 19):
+        return 17
+    if minor == 20:
+        # 1.20.5+ требует Java 21
+        return 21 if patch >= 5 else 17
+    # 1.21 и новее — Java 21
+    return 21
+
+
+def get_required_java_major(minecraft_dir, mc_version):
+    """
+    Возвращает требуемую major-версию Java для указанной MC-версии
+    или None, если определить не удалось.
+    Сначала читает versions/<mc>/<mc>.json (javaVersion.majorVersion),
+    затем откатывается к таблице.
+    """
+    if not mc_version:
+        return None
+    path = os.path.join(
+        minecraft_dir, "versions", mc_version, f"{mc_version}.json"
+    )
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        jv = data.get("javaVersion") or {}
+        major = jv.get("majorVersion")
+        if isinstance(major, int) and major > 0:
+            return major
+    except Exception:
+        pass
+    return _fallback_java_for_mc(mc_version)
 
 
 def _iter_java_candidates():
@@ -1344,7 +1425,6 @@ def fetch_neoforge_mc_versions():
     result = set()
     any_success = False
 
-    # Modern: net.neoforged:neoforge, версии вида 21.1.77 / 20.4.190
     try:
         r = requests.get(
             "https://maven.neoforged.net/api/maven/versions/releases/"
@@ -1375,7 +1455,6 @@ def fetch_neoforge_mc_versions():
     except Exception:
         pass
 
-    # Legacy 1.20.1: net.neoforged:forge, версии вида 1.20.1-47.1.106
     try:
         r = requests.get(
             "https://maven.neoforged.net/api/maven/versions/releases/"
@@ -3747,6 +3826,192 @@ class ModVersionChangeDialog(QDialog):
 
 
 # ============================================================
+#  ОКНО: НАСТРОЙКИ JAVA ДЛЯ ИНСТАНСА
+# ============================================================
+class InstanceJavaDialog(QDialog):
+    """
+    Диалог настройки Java для конкретной сборки.
+    Три варианта: по умолчанию / своя / скачивать автоматически.
+    """
+    def __init__(self, instance_name, inst, minecraft_dir,
+                 global_java_path, parent=None):
+        super().__init__(parent)
+        self.instance_name = instance_name
+        self.inst = inst if isinstance(inst, dict) else {}
+        self.minecraft_dir = minecraft_dir
+        self.global_java_path = global_java_path
+
+        self.result_data = None
+        self.setWindowTitle(f"Java для сборки «{instance_name}»")
+        self.setMinimumSize(560, 380)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        mc_version = self.inst.get("version", "?")
+        required_major = get_required_java_major(
+            self.minecraft_dir, self.inst.get("version")
+        )
+
+        info = QLabel()
+        if required_major:
+            info.setText(
+                f"Требуется: Java {required_major} "
+                f"(по данным Minecraft {mc_version})"
+            )
+        else:
+            info.setText(
+                f"Требуемая версия Java не определена "
+                f"(Minecraft {mc_version})"
+            )
+        info.setWordWrap(True)
+        info.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        layout.addWidget(info)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(line)
+
+        # 1. По умолчанию
+        self.rb_default = QRadioButton("Использовать Java по умолчанию")
+        layout.addWidget(self.rb_default)
+
+        self.default_desc = QLabel(f"    {self._describe_default_java()}")
+        self.default_desc.setStyleSheet("color: #404040;")
+        self.default_desc.setWordWrap(True)
+        layout.addWidget(self.default_desc)
+
+        layout.addSpacing(4)
+
+        # 2. Своя Java
+        self.rb_custom = QRadioButton("Указать свою Java")
+        layout.addWidget(self.rb_custom)
+
+        custom_row = QHBoxLayout()
+        custom_row.setContentsMargins(20, 0, 0, 0)
+        custom_row.setSpacing(4)
+
+        self.custom_path_edit = QLineEdit()
+        self.custom_path_edit.setPlaceholderText(
+            "Путь к java.exe (Windows) или java (Linux/macOS)"
+        )
+        custom_row.addWidget(self.custom_path_edit, 1)
+
+        self.browse_btn = QPushButton("Выбрать...")
+        self.browse_btn.clicked.connect(self._browse_java)
+        custom_row.addWidget(self.browse_btn)
+        layout.addLayout(custom_row)
+
+        layout.addSpacing(4)
+
+        # 3. Managed Java
+        self.rb_managed = QRadioButton("Скачивать Java автоматически")
+        layout.addWidget(self.rb_managed)
+
+        managed_desc = QLabel(
+            "    Лаунчер скачает нужную версию JVM при первом запуске."
+        )
+        managed_desc.setStyleSheet("color: #404040;")
+        managed_desc.setWordWrap(True)
+        layout.addWidget(managed_desc)
+
+        layout.addStretch()
+
+        # Кнопки
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedHeight(26)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("OK")
+        ok_btn.setFixedHeight(26)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.on_ok)
+        btns.addWidget(ok_btn)
+
+        layout.addLayout(btns)
+
+        self._set_initial_state()
+        self._update_enabled_states()
+
+        self.rb_default.toggled.connect(self._update_enabled_states)
+        self.rb_custom.toggled.connect(self._update_enabled_states)
+        self.rb_managed.toggled.connect(self._update_enabled_states)
+
+    def _describe_default_java(self):
+        if self.global_java_path:
+            major = get_java_major(self.global_java_path)
+            if major:
+                return f"Глобальная Java {major}: {self.global_java_path}"
+            return f"Глобальная Java: {self.global_java_path}"
+        return "Автоопределение системной Java (в глобальных настройках)"
+
+    def _set_initial_state(self):
+        jp = self.inst.get("java_path")
+        if isinstance(jp, str) and jp:
+            self.rb_custom.setChecked(True)
+            self.custom_path_edit.setText(jp)
+        elif self.inst.get("use_managed_java") is True:
+            self.rb_managed.setChecked(True)
+        else:
+            self.rb_default.setChecked(True)
+
+    def _update_enabled_states(self):
+        is_custom = self.rb_custom.isChecked()
+        self.custom_path_edit.setEnabled(is_custom)
+        self.browse_btn.setEnabled(is_custom)
+
+    def _browse_java(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите исполняемый файл Java", "",
+            "Java (java;java.exe);;Все файлы (*)"
+        )
+        if path:
+            self.custom_path_edit.setText(path)
+
+    def on_ok(self):
+        if self.rb_default.isChecked():
+            self.result_data = {
+                "java_path": None,
+                "use_managed_java": False,
+            }
+        elif self.rb_custom.isChecked():
+            path = self.custom_path_edit.text().strip()
+            if not path:
+                QMessageBox.warning(
+                    self, "Ошибка",
+                    "Укажите путь к исполняемому файлу Java."
+                )
+                return
+            if not os.path.isfile(path):
+                QMessageBox.warning(
+                    self, "Файл не найден",
+                    f"Файл не найден:\n{path}"
+                )
+                return
+            self.result_data = {
+                "java_path": path,
+                "use_managed_java": False,
+            }
+        elif self.rb_managed.isChecked():
+            self.result_data = {
+                "java_path": None,
+                "use_managed_java": True,
+            }
+        else:
+            QMessageBox.warning(self, "Ошибка", "Выберите вариант.")
+            return
+        self.accept()
+
+
+# ============================================================
 #  ОКНО: СОЗДАНИЕ СБОРКИ
 # ============================================================
 class NewInstanceDialog(QDialog):
@@ -4333,7 +4598,8 @@ class DotLauncher(QMainWindow):
         self.managed_java_check.setToolTip(
             "Лаунчер скачает нужную для этой версии Minecraft Java\n"
             "через minecraft-launcher-lib и запустит игру на ней.\n"
-            "Системная Java и ручной выбор при этом игнорируются."
+            "Системная Java и ручной выбор при этом игнорируются.\n"
+            "Может быть переопределено настройками Java конкретной сборки."
         )
         self.managed_java_check.toggled.connect(self.save_managed_java)
         left_layout.addWidget(self.managed_java_check)
@@ -4580,12 +4846,20 @@ class DotLauncher(QMainWindow):
                     continue
             else:
                 continue
-            out[iid] = {
+            entry = {
                 "name": name, "version": version,
                 "loader": loader, "loader_version": loader_version,
                 "path_rel": path_rel,
                 "modsVerIdentified": bool(inst.get("modsVerIdentified", False)),
             }
+            # Per-instance Java (опциональные поля; отсутствие = "по умолчанию")
+            jp = inst.get("java_path")
+            if isinstance(jp, str) and jp:
+                entry["java_path"] = jp
+            umj = inst.get("use_managed_java")
+            if isinstance(umj, bool):
+                entry["use_managed_java"] = umj
+            out[iid] = entry
         return out
 
     def save_config(self):
@@ -4648,6 +4922,92 @@ class DotLauncher(QMainWindow):
             self.save_config()
             self.java_status.setText("Java: авто")
         return find_java()
+
+    def _resolve_java_for_instance(self, inst, minecraft_dir):
+        """
+        Определяет Java для конкретного инстанса.
+
+        Возвращает кортеж:
+            (java_path, java_major, source, required_major)
+
+        source:
+            "instance"  — своя Java инстанса
+            "managed"   — скачивать managed (java_path = None)
+            "global"    — глобальная Java
+            "auto"      — автоопределение
+            None        — ничего не найдено
+
+        required_major — требуемая major-версия для MC инстанса или None.
+        """
+        mc_version = inst.get("version")
+        required_major = get_required_java_major(minecraft_dir, mc_version)
+
+        # 1. Своя Java инстанса
+        jp = inst.get("java_path")
+        if isinstance(jp, str) and jp:
+            if os.path.isfile(jp):
+                major = get_java_major(jp)
+                return jp, major, "instance", required_major
+            # Путь сохранён, но файл пропал — сообщаем и идём дальше
+            self.log(
+                f"[Внимание] Java инстанса не найдена: {jp!r}, ищу дальше."
+            )
+
+        # 2. Managed Java, включённая на инстансе
+        if inst.get("use_managed_java") is True:
+            return None, None, "managed", required_major
+
+        # 3. Если на инстансе выбор не зафиксирован — используем глобальный managed
+        if (inst.get("use_managed_java") is None
+                and self.managed_java_check.isChecked()):
+            return None, None, "managed", required_major
+
+        # 4. Глобальная Java
+        jp = self.config.get("java_path")
+        if jp and os.path.isfile(jp):
+            major = get_java_major(jp)
+            return jp, major, "global", required_major
+
+        # 5. Автоопределение (с учётом требуемой версии)
+        path, major = find_java(min_major=required_major or 17)
+        if path:
+            return path, major, "auto", required_major
+
+        return None, None, None, required_major
+
+    def _open_instance_java_settings(self, instance_id):
+        if instance_id not in self.instances:
+            return
+        inst = self.instances[instance_id]
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+
+        global_java_path = self.config.get("java_path")
+
+        dlg = InstanceJavaDialog(
+            inst["name"], inst, minecraft_dir, global_java_path,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dlg.result_data:
+            return
+
+        data = dlg.result_data
+        if data.get("java_path"):
+            inst["java_path"] = data["java_path"]
+            inst["use_managed_java"] = False
+        elif data.get("use_managed_java"):
+            inst["java_path"] = None
+            inst["use_managed_java"] = True
+        else:
+            inst["java_path"] = None
+            inst["use_managed_java"] = False
+
+        self.save_instances()
+        self.log(
+            f"[dotLauncher] Настройки Java для «{inst['name']}» сохранены."
+        )
 
     # ---------- АККАУНТЫ ----------
     def _active_account(self):
@@ -5172,6 +5532,8 @@ class DotLauncher(QMainWindow):
         else:
             act_expand = menu.addAction("Развернуть сборку")
 
+        act_java = menu.addAction("Настройки Java...")
+
         act_folder = menu.addAction("Открыть папку сборки")
         act_screenshots = menu.addAction("Открыть скриншоты")
 
@@ -5191,6 +5553,8 @@ class DotLauncher(QMainWindow):
             self.play_game()
         elif chosen == act_expand:
             self.toggle_expand()
+        elif chosen == act_java:
+            self._open_instance_java_settings(instance_id)
         elif chosen == act_folder:
             self.open_instance_folder()
         elif chosen == act_screenshots:
@@ -5804,39 +6168,77 @@ class DotLauncher(QMainWindow):
                 return
             elyby = True
 
-        use_managed = self.managed_java_check.isChecked()
+        memory = safe_int(self.config.get("memory_mb"), DEFAULT_MEMORY_MB)
+        instance_dir = self._instance_abs_path(inst)
+        minecraft_dir = os.path.join(instance_dir, ".minecraft")
+
+        # --- Разрешение Java для конкретного инстанса ---
+        java_path, java_major, java_source, required_major = (
+            self._resolve_java_for_instance(inst, minecraft_dir)
+        )
+        use_managed = (java_source == "managed")
 
         if use_managed:
             self.log(
-                "[dotLauncher] Режим: managed Java "
-                "(скачается при первом запуске)."
+                f"[dotLauncher] Режим: managed Java для сборки «{inst['name']}» "
+                f"(будет скачана при первом запуске)."
             )
-            java_path, java_major = None, None
+            java_path = None
         else:
-            java_path, java_major = self._resolve_java()
             if not java_path:
-                QMessageBox.critical(
-                    self, "Java не найдена",
-                    "Не удалось найти Java 17+ на этом компьютере.\n\n"
-                    "Установите JDK/JRE 17 или новее, укажите путь к "
-                    "java.exe кнопкой «Выбрать Java...» или включите "
+                msg = "Не удалось найти Java"
+                if required_major:
+                    msg += f" {required_major}+"
+                msg += " на этом компьютере.\n\n"
+                msg += (
+                    "Установите JDK/JRE"
+                    + (f" {required_major}+" if required_major else " 17+")
+                    + ", укажите путь к java.exe кнопкой «Выбрать Java...», "
+                    "настройте Java для этой сборки (правая кнопка → "
+                    "«Настройки Java...») или включите "
                     "«Скачивать Java автоматически»."
                 )
-                self.log("[Ошибка] Java не найдена. Установите JDK/JRE 17+.")
+                QMessageBox.critical(self, "Java не найдена", msg)
+                self.log("[Ошибка] Java не найдена для сборки.")
                 return
-            if java_major is None:
-                self.log(f"[dotLauncher] Java: {java_path} (версия не определена)")
+
+            if (required_major is not None and java_major is not None
+                    and java_major < required_major):
+                QMessageBox.critical(
+                    self, "Java несовместима",
+                    f"Для Minecraft {inst['version']} требуется "
+                    f"Java {required_major} или новее.\n\n"
+                    f"Текущая Java: {java_major}\n\n"
+                    f"Настройте Java для этой сборки "
+                    f"(правая кнопка → «Настройки Java...») или включите "
+                    f"«Скачивать Java автоматически»."
+                )
+                self.log(
+                    f"[Ошибка] Java {java_major} < требуемой {required_major} "
+                    f"для Minecraft {inst['version']}."
+                )
+                return
+
+            if (required_major is not None and java_major is not None
+                    and java_major > required_major):
+                self.log(
+                    f"[Внимание] Java {java_major} новее требуемой "
+                    f"({required_major}) для Minecraft {inst['version']}. "
+                    f"Возможны проблемы совместимости."
+                )
+
+            source_label = {
+                "instance": "Java инстанса",
+                "global": "Глобальная Java",
+                "auto": "Автоопределение",
+            }.get(java_source, "Java")
+            if java_major is not None:
+                self.log(
+                    f"[dotLauncher] {source_label}: {java_path} "
+                    f"(major={java_major})"
+                )
             else:
-                self.log(f"[dotLauncher] Java: {java_path} (major={java_major})")
-                if java_major < 17:
-                    self.log(
-                        f"[Внимание] Java {java_major} может быть недостаточна "
-                        f"для современных версий Minecraft."
-                    )
-
-        memory = safe_int(self.config.get("memory_mb"), DEFAULT_MEMORY_MB)
-
-        instance_dir = self._instance_abs_path(inst)
+                self.log(f"[dotLauncher] {source_label}: {java_path}")
 
         self.play_button.setEnabled(False)
         self.play_button.setText("Загрузка...")
