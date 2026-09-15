@@ -21,6 +21,7 @@ import logging
 import traceback
 import socket
 import base64
+import xml.etree.ElementTree as ET
 
 _orig_getaddrinfo = socket.getaddrinfo
 def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -78,7 +79,10 @@ DEFAULT_MEMORY_MB = 2048
 MIN_MEMORY_MB = 1024
 MAX_MEMORY_MB = 32768
 
+VANILLA_LOADER_ID = "vanilla"
+
 MOD_LOADERS = {
+    "vanilla": "Без загрузчика",
     "fabric": "Fabric",
     "forge": "Forge",
     "neoforge": "NeoForge",
@@ -1128,7 +1132,6 @@ def extract_mod_ids(jar_path):
         with zipfile.ZipFile(jar_path, "r") as zf:
             namelist = zf.namelist()
 
-            # Fabric
             if "fabric.mod.json" in namelist:
                 data = None
                 try:
@@ -1144,7 +1147,6 @@ def extract_mod_ids(jar_path):
                 if ids:
                     return ("fabric", ids)
 
-            # Forge
             if "META-INF/mods.toml" in namelist and tomllib is not None:
                 data = None
                 try:
@@ -1157,7 +1159,6 @@ def extract_mod_ids(jar_path):
                 if ids:
                     return ("forge", ids)
 
-            # NeoForge
             if "META-INF/neoforge.mods.toml" in namelist and tomllib is not None:
                 data = None
                 try:
@@ -1191,16 +1192,11 @@ def _empty_manifest():
 
 
 def _rebuild_by_mod_id(manifest):
-    """
-    Строит обратный индекс loader::modId -> filename.
-    Активные моды перезаписывают disabled при коллизии.
-    """
     by_id = {}
     mods = manifest.get("mods") or {}
     if not isinstance(mods, dict):
         return by_id
 
-    # Сначала disabled, потом активные (активные перезаписывают)
     for disabled_pass in (True, False):
         for fn in sorted(mods.keys()):
             entry = mods.get(fn)
@@ -1258,10 +1254,6 @@ def save_mod_manifest(instance_dir, manifest):
 
 
 def build_mod_manifest_entry(jar_path, loader_hint=None, extra=None, disabled=False):
-    """
-    Строит словарь для манифеста на основе данных jar'а.
-    extra — необязательный dict, значения которого вольются поверх.
-    """
     entry = {
         "loader": None,
         "mod_ids": [],
@@ -1289,7 +1281,6 @@ def build_mod_manifest_entry(jar_path, loader_hint=None, extra=None, disabled=Fa
 
 
 def merge_manifest_entry(manifest, filename, entry):
-    """Обновляет/добавляет запись и перестраивает обратный индекс."""
     if not isinstance(manifest.get("mods"), dict):
         manifest["mods"] = {}
     manifest["mods"][filename] = entry
@@ -1297,11 +1288,133 @@ def merge_manifest_entry(manifest, filename, entry):
 
 
 def remove_manifest_entry(manifest, filename):
-    """Удаляет запись и перестраивает обратный индекс."""
     mods = manifest.get("mods")
     if isinstance(mods, dict):
         mods.pop(filename, None)
     manifest["by_mod_id"] = _rebuild_by_mod_id(manifest)
+
+
+# ============================================================
+#  ПРОВЕРКА СОВМЕСТИМОСТИ ЗАГРУЗЧИКОВ С MC
+# ============================================================
+def fetch_fabric_mc_versions():
+    """MC-версии, поддерживаемые Fabric. None при ошибке."""
+    try:
+        r = requests.get(
+            "https://meta.fabricmc.net/v2/versions/game", timeout=7
+        )
+        r.raise_for_status()
+        data = r.json()
+        result = set()
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    v = item.get("version")
+                    if isinstance(v, str) and v:
+                        result.add(v)
+        return result or None
+    except Exception:
+        return None
+
+
+def fetch_forge_mc_versions():
+    """MC-версии, поддерживаемые Forge. None при ошибке."""
+    try:
+        r = requests.get(
+            "https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml",
+            timeout=7,
+        )
+        r.raise_for_status()
+        root = ET.fromstring(r.text)
+        result = set()
+        for ver in root.iter("version"):
+            text = (ver.text or "").strip()
+            if not text:
+                continue
+            mc = text.split("-", 1)[0]
+            if mc:
+                result.add(mc)
+        return result or None
+    except Exception:
+        return None
+
+
+def fetch_neoforge_mc_versions():
+    """MC-версии, поддерживаемые NeoForge (modern + legacy 1.20.1). None при полной ошибке."""
+    result = set()
+    any_success = False
+
+    # Modern: net.neoforged:neoforge, версии вида 21.1.77 / 20.4.190
+    try:
+        r = requests.get(
+            "https://maven.neoforged.net/api/maven/versions/releases/"
+            "net/neoforged/neoforge",
+            timeout=7,
+        )
+        r.raise_for_status()
+        data = r.json()
+        for v in (data.get("versions") or []):
+            if not isinstance(v, str):
+                continue
+            parts = v.split(".")
+            if len(parts) < 2:
+                continue
+            try:
+                major = int(parts[0])
+                minor = int(parts[1])
+            except ValueError:
+                continue
+            if major == 20 and minor in (2, 4, 6):
+                result.add(f"1.20.{minor}")
+            elif major == 21:
+                if minor == 0:
+                    result.add("1.21")
+                else:
+                    result.add(f"1.21.{minor}")
+        any_success = True
+    except Exception:
+        pass
+
+    # Legacy 1.20.1: net.neoforged:forge, версии вида 1.20.1-47.1.106
+    try:
+        r = requests.get(
+            "https://maven.neoforged.net/api/maven/versions/releases/"
+            "net/neoforged/forge",
+            timeout=7,
+        )
+        r.raise_for_status()
+        data = r.json()
+        for v in (data.get("versions") or []):
+            if isinstance(v, str):
+                mc = v.split("-", 1)[0]
+                if mc:
+                    result.add(mc)
+        any_success = True
+    except Exception:
+        pass
+
+    return result if any_success else None
+
+
+class LoaderCompatFetchThread(QThread):
+    """Фоново загружает совместимость загрузчиков с MC-версиями."""
+    finished_signal = pyqtSignal(dict)  # {loader_id: set(mc_versions) | None}
+
+    def __init__(self):
+        super().__init__()
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        result = {
+            "fabric": fetch_fabric_mc_versions(),
+            "forge": fetch_forge_mc_versions(),
+            "neoforge": fetch_neoforge_mc_versions(),
+        }
+        if not self._stop:
+            self.finished_signal.emit(result)
 
 
 # ============================================================
@@ -1515,12 +1628,20 @@ class LauncherThread(QThread):
 
     def run(self):
         try:
-            self.installing_signal.emit(True)
+            is_vanilla = (not self.loader_id) or self.loader_id == VANILLA_LOADER_ID
             loader_name = MOD_LOADERS.get(self.loader_id, self.loader_id)
-            self.log_signal.emit(
-                f"[dotLauncher] Начинаю установку Minecraft {self.version} "
-                f"с {loader_name}..."
-            )
+
+            if is_vanilla:
+                self.log_signal.emit(
+                    f"[dotLauncher] Запуск ванильного Minecraft {self.version}..."
+                )
+            else:
+                self.log_signal.emit(
+                    f"[dotLauncher] Начинаю установку Minecraft {self.version} "
+                    f"с {loader_name}..."
+                )
+
+            self.installing_signal.emit(True)
             minecraft_dir = os.path.join(self.instance_path, ".minecraft")
             os.makedirs(minecraft_dir, exist_ok=True)
 
@@ -1543,48 +1664,54 @@ class LauncherThread(QThread):
 
             self._prepend_java_to_path(effective_java)
 
-            self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
-            mod_loader = minecraft_launcher_lib.mod_loader.get_mod_loader(
-                self.loader_id
-            )
-
-            loader_version = self.loader_version
-            if not loader_version:
-                try:
-                    loader_version = mod_loader.get_latest_loader_version(
-                        self.version
-                    )
-                except Exception:
-                    loader_version = None
-
-            if not loader_version:
-                raise Exception(
-                    f"Не удалось определить версию {loader_name} "
-                    f"для Minecraft {self.version}"
+            if not is_vanilla:
+                self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
+                mod_loader = minecraft_launcher_lib.mod_loader.get_mod_loader(
+                    self.loader_id
                 )
 
-            self.log_signal.emit(
-                f"[dotLauncher] Версия {loader_name}: {loader_version}"
-            )
+                loader_version = self.loader_version
+                if not loader_version:
+                    try:
+                        loader_version = mod_loader.get_latest_loader_version(
+                            self.version
+                        )
+                    except Exception:
+                        loader_version = None
 
-            mod_loader.install(
-                self.version,
-                minecraft_dir,
-                loader_version=loader_version,
-                callback=callback,
-                java=effective_java,
-            )
+                if not loader_version:
+                    raise Exception(
+                        f"Не удалось определить версию {loader_name} "
+                        f"для Minecraft {self.version}"
+                    )
 
-            if self._stop:
-                self.finished_signal.emit(False, "Отменено пользователем")
-                return
+                self.log_signal.emit(
+                    f"[dotLauncher] Версия {loader_name}: {loader_version}"
+                )
 
-            installed_version = mod_loader.get_installed_version(
-                self.version, loader_version
-            )
-            self.log_signal.emit(
-                f"[dotLauncher] Идентификатор версии для запуска: {installed_version}"
-            )
+                mod_loader.install(
+                    self.version,
+                    minecraft_dir,
+                    loader_version=loader_version,
+                    callback=callback,
+                    java=effective_java,
+                )
+
+                if self._stop:
+                    self.finished_signal.emit(False, "Отменено пользователем")
+                    return
+
+                installed_version = mod_loader.get_installed_version(
+                    self.version, loader_version
+                )
+                self.log_signal.emit(
+                    f"[dotLauncher] Идентификатор версии для запуска: {installed_version}"
+                )
+            else:
+                installed_version = self.version
+                self.log_signal.emit(
+                    f"[dotLauncher] Ванильная версия для запуска: {installed_version}"
+                )
 
             jvm_args = [
                 f"-Xmx{self.memory_mb}M",
@@ -1757,10 +1884,6 @@ class ElybyRefreshThread(QThread):
 #  ПОТОК: ИНДЕКСАЦИЯ МОДОВ (манифест)
 # ============================================================
 class ModManifestRebuildThread(QThread):
-    """
-    Сканирует mods/ и disabledMods/, извлекает modId+loader+sha1 из каждого jar,
-    опционально запрашивает project_id у Modrinth, сохраняет манифест.
-    """
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(bool, str, str)  # ok, error, instance_id
 
@@ -1810,7 +1933,6 @@ class ModManifestRebuildThread(QThread):
                         full, loader_hint=self.loader_id, disabled=disabled
                     )
 
-                    # Опционально уточняем project_id через Modrinth по SHA1
                     if (self.fetch_modrinth
                             and entry.get("sha1")
                             and modrinth_failures < self.MAX_MODRINTH_FAILURES):
@@ -2199,11 +2321,19 @@ class InstanceInstallThread(QThread):
 
     def run(self):
         try:
+            is_vanilla = (not self.loader_id) or self.loader_id == VANILLA_LOADER_ID
             loader_name = MOD_LOADERS.get(self.loader_id, self.loader_id)
-            self.log_signal.emit(
-                f"[dotLauncher] Создание сборки «{self.name}»: "
-                f"Minecraft {self.version} + {loader_name}"
-            )
+
+            if is_vanilla:
+                self.log_signal.emit(
+                    f"[dotLauncher] Создание ванильной сборки «{self.name}»: "
+                    f"Minecraft {self.version}"
+                )
+            else:
+                self.log_signal.emit(
+                    f"[dotLauncher] Создание сборки «{self.name}»: "
+                    f"Minecraft {self.version} + {loader_name}"
+                )
 
             instance_dir = os.path.join(self.instances_dir, self.instance_id)
             minecraft_dir = os.path.join(instance_dir, ".minecraft")
@@ -2223,44 +2353,51 @@ class InstanceInstallThread(QThread):
                 )
                 return
 
-            self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
-            mod_loader = minecraft_launcher_lib.mod_loader.get_mod_loader(
-                self.loader_id
-            )
+            loader_version = None
 
-            try:
-                loader_version = mod_loader.get_latest_loader_version(self.version)
-            except Exception:
-                loader_version = None
-
-            if not loader_version:
-                raise Exception(
-                    f"Не удалось определить версию {loader_name} "
-                    f"для Minecraft {self.version}"
+            if not is_vanilla:
+                self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
+                mod_loader = minecraft_launcher_lib.mod_loader.get_mod_loader(
+                    self.loader_id
                 )
 
-            self.log_signal.emit(
-                f"[dotLauncher] Версия {loader_name}: {loader_version}"
-            )
+                try:
+                    loader_version = mod_loader.get_latest_loader_version(self.version)
+                except Exception:
+                    loader_version = None
 
-            install_kwargs = {}
-            if self.java_path:
-                install_kwargs["java"] = self.java_path
+                if not loader_version:
+                    raise Exception(
+                        f"Не удалось определить версию {loader_name} "
+                        f"для Minecraft {self.version}"
+                    )
 
-            mod_loader.install(
-                self.version,
-                minecraft_dir,
-                loader_version=loader_version,
-                callback=callback,
-                **install_kwargs,
-            )
-
-            if self._stop:
-                self.finished_signal.emit(
-                    False, {"instance_id": self.instance_id},
-                    "Отменено пользователем"
+                self.log_signal.emit(
+                    f"[dotLauncher] Версия {loader_name}: {loader_version}"
                 )
-                return
+
+                install_kwargs = {}
+                if self.java_path:
+                    install_kwargs["java"] = self.java_path
+
+                mod_loader.install(
+                    self.version,
+                    minecraft_dir,
+                    loader_version=loader_version,
+                    callback=callback,
+                    **install_kwargs,
+                )
+
+                if self._stop:
+                    self.finished_signal.emit(
+                        False, {"instance_id": self.instance_id},
+                        "Отменено пользователем"
+                    )
+                    return
+            else:
+                self.log_signal.emit(
+                    "[dotLauncher] Ванильная установка завершена."
+                )
 
             path_rel = os.path.relpath(instance_dir, self.workspace)
             info = {
@@ -2313,8 +2450,7 @@ class ModrinthSearchThread(QThread):
 
 
 class ModrinthVersionsThread(QThread):
-    """Загружает список версий проекта."""
-    finished_signal = pyqtSignal(bool, list, str, str)  # ok, versions, error, project_id
+    finished_signal = pyqtSignal(bool, list, str, str)
 
     def __init__(self, project_id, loader, mc_version, project_type="mod"):
         super().__init__()
@@ -2389,7 +2525,6 @@ class ModrinthDownloadThread(QThread):
         if not self.download_deps:
             return
 
-        # Зависимости учитываем только для модов.
         if self.project_type != "mod":
             return
 
@@ -2514,15 +2649,17 @@ class ClickableFrame(QFrame):
 #  ОКНО MODRINTH
 # ============================================================
 class ModrinthWindow(QDialog):
-    def __init__(self, instance_name, loader_id, mc_version, instance_dir, parent=None):
+    def __init__(self, instance_name, loader_id, mc_version, instance_dir,
+                 parent=None, vanilla=False):
         super().__init__(parent)
         self.instance_name = instance_name
         self.loader_id = loader_id
         self.mc_version = mc_version
         self.instance_dir = instance_dir
         self.minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        self.vanilla = bool(vanilla)
 
-        self.current_type = "mod"
+        self.current_type = "resourcepack" if self.vanilla else "mod"
 
         # chosen: pid -> {"hit": hit, "version_id": str|None, "version_label": str}
         self.chosen = {}
@@ -2531,13 +2668,11 @@ class ModrinthWindow(QDialog):
         self.download_thread = None
         self.versions_thread = None
 
-        # Состояние панели версий
         self.active_project_id = None
         self.active_hit = None
         self.active_versions = []
-        self.project_version_ids = {}  # pid -> version_id
+        self.project_version_ids = {}
 
-        # Был ли скачан хотя бы один мод (для инвалидации манифеста)
         self.downloaded_mods = False
 
         self.setWindowTitle(f"Modrinth — {instance_name}")
@@ -2555,7 +2690,7 @@ class ModrinthWindow(QDialog):
             return os.path.join(self.minecraft_dir, "mods")
         elif self.current_type == "resourcepack":
             return os.path.join(self.minecraft_dir, "resourcepacks")
-        else:  # shader
+        else:
             return os.path.join(self.minecraft_dir, "shaderpacks")
 
     def init_ui(self):
@@ -2574,7 +2709,6 @@ class ModrinthWindow(QDialog):
         v = QVBoxLayout(page)
         v.setContentsMargins(0, 0, 0, 0)
 
-        # Заголовок: "Поиск [модов ▾] для Fabric 1.20.1"
         header_row = QHBoxLayout()
         header_row.setSpacing(4)
 
@@ -2583,14 +2717,20 @@ class ModrinthWindow(QDialog):
         header_row.addWidget(header_left)
 
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["модов", "ресурспаков", "шейдеров"])
+        if self.vanilla:
+            self.type_combo.addItems(["ресурспаков", "шейдеров"])
+        else:
+            self.type_combo.addItems(["модов", "ресурспаков", "шейдеров"])
         self.type_combo.setFixedWidth(140)
         self.type_combo.currentIndexChanged.connect(self.on_type_changed)
         header_row.addWidget(self.type_combo)
 
-        self.header_suffix = QLabel(
-            f"для {self.loader_name()} {self.mc_version}"
-        )
+        if self.vanilla:
+            self.header_suffix = QLabel(f"для Minecraft {self.mc_version}")
+        else:
+            self.header_suffix = QLabel(
+                f"для {self.loader_name()} {self.mc_version}"
+            )
         self.header_suffix.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         header_row.addWidget(self.header_suffix)
 
@@ -2599,7 +2739,10 @@ class ModrinthWindow(QDialog):
 
         row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Введите название...")
+        if self.vanilla:
+            self.search_input.setPlaceholderText("Введите название ресурспака...")
+        else:
+            self.search_input.setPlaceholderText("Введите название...")
         self.search_input.returnPressed.connect(self.do_search)
         row.addWidget(self.search_input)
 
@@ -2612,11 +2755,9 @@ class ModrinthWindow(QDialog):
         self.search_status = QLabel("")
         v.addWidget(self.search_status)
 
-        # Разделитель: слева результаты, справа версии
         content_splitter = QSplitter(Qt.Orientation.Horizontal)
         content_splitter.setHandleWidth(3)
 
-        # --- левая колонка: результаты ---
         results_container = QWidget()
         rc = QVBoxLayout(results_container)
         rc.setContentsMargins(0, 0, 0, 0)
@@ -2640,17 +2781,16 @@ class ModrinthWindow(QDialog):
 
         content_splitter.addWidget(results_container)
 
-        # --- правая колонка: версии ---
         versions_container = QWidget()
         vc = QVBoxLayout(versions_container)
         vc.setContentsMargins(0, 0, 0, 0)
         vc.setSpacing(2)
 
-        versions_label = QLabel("Версии мода")
+        versions_label = QLabel("Версии")
         versions_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         vc.addWidget(versions_label)
 
-        self.versions_info = QLabel("Кликните на мод слева, чтобы увидеть его версии")
+        self.versions_info = QLabel("Кликните на элемент слева, чтобы увидеть версии")
         self.versions_info.setWordWrap(True)
         vc.addWidget(self.versions_info)
 
@@ -2714,6 +2854,9 @@ class ModrinthWindow(QDialog):
 
         self.deps_check = QCheckBox("Скачать все зависимости (только для модов)")
         self.deps_check.setChecked(True)
+        if self.vanilla:
+            self.deps_check.setEnabled(False)
+            self.deps_check.setChecked(False)
         v.addWidget(self.deps_check)
 
         back_btn = QPushButton("Назад")
@@ -2722,26 +2865,32 @@ class ModrinthWindow(QDialog):
 
         return page
 
+    def _types_list(self):
+        if self.vanilla:
+            return ["resourcepack", "shader"]
+        return ["mod", "resourcepack", "shader"]
+
     def on_type_changed(self, idx):
-        if idx == 0:
-            self.current_type = "mod"
+        types = self._types_list()
+        if idx < 0 or idx >= len(types):
+            return
+        self.current_type = types[idx]
+
+        if self.current_type == "mod":
             self.header_suffix.setText(
                 f"для {self.loader_name()} {self.mc_version}"
             )
             self.search_input.setPlaceholderText("Введите название мода...")
             self.deps_check.setEnabled(True)
-        elif idx == 1:
-            self.current_type = "resourcepack"
+        elif self.current_type == "resourcepack":
             self.header_suffix.setText(f"для Minecraft {self.mc_version}")
             self.search_input.setPlaceholderText("Введите название ресурспака...")
             self.deps_check.setEnabled(False)
         else:
-            self.current_type = "shader"
             self.header_suffix.setText(f"для Minecraft {self.mc_version}")
             self.search_input.setPlaceholderText("Введите название шейдера...")
             self.deps_check.setEnabled(False)
 
-        # Сбрасываем панель версий — она привязана к текущему типу
         self._reset_versions_panel()
 
         query = self.search_input.text().strip()
@@ -2797,10 +2946,9 @@ class ModrinthWindow(QDialog):
         self.active_hit = None
         self.active_versions = []
         self.versions_list.clear()
-        self.versions_info.setText("Кликните на мод слева, чтобы увидеть его версии")
+        self.versions_info.setText("Кликните на элемент слева, чтобы увидеть версии")
         self.versions_status.setText("")
 
-    # ---------- РАБОТА С ВЕРСИЯМИ ----------
     def _on_card_clicked(self, pid, hit):
         if pid == self.active_project_id:
             return
@@ -2814,7 +2962,6 @@ class ModrinthWindow(QDialog):
         self.versions_status.setText("Загрузка версий...")
 
         if self.versions_thread and self.versions_thread.isRunning():
-            # Отключаемся от предыдущего потока
             try:
                 self.versions_thread.finished_signal.disconnect()
             except Exception:
@@ -2827,7 +2974,6 @@ class ModrinthWindow(QDialog):
         self.versions_thread.start()
 
     def _on_versions_loaded(self, success, versions, error, project_id):
-        # Игнорируем устаревшие ответы
         if project_id != self.active_project_id:
             return
         if not success:
@@ -2848,7 +2994,6 @@ class ModrinthWindow(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, vdata)
             self.versions_list.addItem(item)
 
-        # Авто-выбор первой версии
         if self.versions_list.count() > 0:
             self.versions_list.setCurrentRow(0)
 
@@ -2902,7 +3047,6 @@ class ModrinthWindow(QDialog):
         if pid in self.chosen:
             btn.setText("Добавлено ✓")
 
-        # Клик по карточке — активация и загрузка версий
         card.clicked.connect(lambda _pid=pid, _hit=hit: self._on_card_clicked(_pid, _hit))
 
         def on_click(_checked=False, _pid=pid, _hit=hit, _btn=btn):
@@ -2910,9 +3054,7 @@ class ModrinthWindow(QDialog):
                 del self.chosen[_pid]
                 _btn.setText("Скачать")
             else:
-                # Определяем версию
                 vid = self.project_version_ids.get(_pid)
-                # Если карточка активна и vid не задан, но есть загруженные версии — берём первую
                 if vid is None and _pid == self.active_project_id and self.active_versions:
                     vid = self.active_versions[0].get("id")
                     if vid:
@@ -2925,7 +3067,6 @@ class ModrinthWindow(QDialog):
                             label = format_mod_version_label(vdata)
                             break
                     else:
-                        # Возможно, версия хранится от другой карточки — просто покажем ID
                         label = f"ID: {vid[:8]}…"
 
                 self.chosen[_pid] = {
@@ -3026,7 +3167,6 @@ class ModrinthWindow(QDialog):
         self.download_btn.setEnabled(True)
         self.download_btn.setText("Скачать")
         if success:
-            # Если скачивали мод — пометим манифест устаревшим
             if self.current_type == "mod":
                 self.downloaded_mods = True
             QMessageBox.information(self, "Готово", message)
@@ -3057,8 +3197,7 @@ class ModrinthWindow(QDialog):
 #  ПОТОКИ: ЗАМЕНА ВЕРСИИ МОДА
 # ============================================================
 class ModVersionLookupThread(QThread):
-    """Ищет версию мода на Modrinth по SHA1 файла."""
-    finished_signal = pyqtSignal(bool, dict, str)  # ok, version_data, error
+    finished_signal = pyqtSignal(bool, dict, str)
 
     def __init__(self, file_hash):
         super().__init__()
@@ -3080,7 +3219,6 @@ class ModVersionLookupThread(QThread):
 
 
 class ModVersionReplaceThread(QThread):
-    """Скачивает выбранную версию мода и заменяет старый файл."""
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(bool, str)
@@ -3179,7 +3317,6 @@ class ModVersionReplaceThread(QThread):
 
     def run(self):
         try:
-            files = self.version_data.get("files", []) or []
             primary = self._pick_primary_file(self.version_data)
             if not primary:
                 self.finished_signal.emit(False, "У выбранной версии нет файлов")
@@ -3192,7 +3329,6 @@ class ModVersionReplaceThread(QThread):
             new_abs = os.path.realpath(target_path)
             same_file = (old_abs == new_abs)
 
-            # 1. Скачиваем основной файл во временный путь
             tmp_main = os.path.join(
                 self.target_dir, f".dotlauncher_replace_{uuid.uuid4().hex[:8]}.tmp"
             )
@@ -3206,7 +3342,6 @@ class ModVersionReplaceThread(QThread):
                         raise Exception("Отменено")
                     f.write(chunk)
 
-            # 2. Собираем и скачиваем зависимости
             deps_downloaded = 0
             if self.download_deps:
                 deps = {}
@@ -3224,7 +3359,6 @@ class ModVersionReplaceThread(QThread):
                         self.log_signal.emit(f"Ошибка загрузки зависимости: {e}")
                     self.progress_signal.emit(i, total)
 
-            # 3. Удаляем старый файл (если путь отличается)
             if not same_file and os.path.isfile(self.old_mod_path):
                 try:
                     os.remove(self.old_mod_path)
@@ -3234,9 +3368,7 @@ class ModVersionReplaceThread(QThread):
                 except Exception as e:
                     self.log_signal.emit(f"Не удалось удалить старый мод: {e}")
 
-            # 4. Перемещаем новый файл на место
             if os.path.exists(target_path):
-                # Уже был файл с таким именем — перезапишем
                 try:
                     os.remove(target_path)
                 except OSError:
@@ -3250,7 +3382,6 @@ class ModVersionReplaceThread(QThread):
             self.finished_signal.emit(True, msg)
 
         except Exception as e:
-            # чистим временный
             try:
                 if os.path.exists(tmp_main):
                     os.remove(tmp_main)
@@ -3301,7 +3432,6 @@ class ModVersionChangeDialog(QDialog):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # Заголовок
         header_row = QHBoxLayout()
         header_left = QLabel("Изменение версии мода")
         header_left.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
@@ -3315,7 +3445,6 @@ class ModVersionChangeDialog(QDialog):
         header_row.addStretch()
         layout.addLayout(header_row)
 
-        # Информация о моде
         self.mod_info = QLabel(f"Файл: {self.mod_filename}")
         self.mod_info.setWordWrap(True)
         layout.addWidget(self.mod_info)
@@ -3324,7 +3453,6 @@ class ModVersionChangeDialog(QDialog):
         self.lookup_status.setWordWrap(True)
         layout.addWidget(self.lookup_status)
 
-        # Список версий
         versions_label = QLabel("Доступные версии")
         versions_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         layout.addWidget(versions_label)
@@ -3337,7 +3465,6 @@ class ModVersionChangeDialog(QDialog):
         self.versions_status.setWordWrap(True)
         layout.addWidget(self.versions_status)
 
-        # Прогресс + лог
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
@@ -3348,7 +3475,6 @@ class ModVersionChangeDialog(QDialog):
         self.log_area.setVisible(False)
         layout.addWidget(self.log_area)
 
-        # Кнопки
         self.deps_check = QCheckBox("Скачать зависимости выбранной версии")
         self.deps_check.setChecked(True)
         layout.addWidget(self.deps_check)
@@ -3369,9 +3495,7 @@ class ModVersionChangeDialog(QDialog):
 
         layout.addLayout(btns)
 
-    # ---------- ПОИСК МОДА ----------
     def _start_lookup(self):
-        # 1. Если манифест знает project_id — идём напрямую
         if self.manifest_entry:
             mr = self.manifest_entry.get("modrinth")
             if isinstance(mr, dict) and mr.get("project_id"):
@@ -3393,7 +3517,6 @@ class ModVersionChangeDialog(QDialog):
                 self._load_versions()
                 return
 
-        # 2. Иначе — SHA1 lookup
         try:
             file_hash = sha1_file(self.mod_path)
         except Exception as e:
@@ -3441,7 +3564,6 @@ class ModVersionChangeDialog(QDialog):
             )
             return
 
-        # Обновим манифест: теперь мы знаем project_id
         self._update_manifest_with_project_info(
             project_id=self.project_id,
             version_id=self.current_version_id,
@@ -3476,7 +3598,6 @@ class ModVersionChangeDialog(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, vdata)
             self.versions_list.addItem(item)
 
-        # Авто-выбор первой попавшейся не текущей версии
         if self.versions_list.count() > 0:
             self.versions_list.setCurrentRow(0)
 
@@ -3489,7 +3610,6 @@ class ModVersionChangeDialog(QDialog):
         self.selected_version = items[0].data(Qt.ItemDataRole.UserRole)
         if isinstance(self.selected_version, dict):
             self.apply_btn.setEnabled(True)
-            # Не даём выбрать ту же самую версию
             if self.selected_version.get("id") == self.current_version_id:
                 self.apply_btn.setEnabled(False)
                 self.versions_status.setText("Уже установлена эта версия.")
@@ -3498,7 +3618,6 @@ class ModVersionChangeDialog(QDialog):
         else:
             self.apply_btn.setEnabled(False)
 
-    # ---------- ОБНОВЛЕНИЕ МАНИФЕСТА ----------
     def _update_manifest_with_project_info(self, project_id, version_id,
                                            version_number, project_title):
         try:
@@ -3526,10 +3645,8 @@ class ModVersionChangeDialog(QDialog):
         except Exception:
             return
 
-        # Удаляем старую запись
         remove_manifest_entry(manifest, self.mod_filename)
 
-        # Определяем новый файл
         primary = self._pick_primary_file(self.selected_version)
         new_filename = None
         if primary:
@@ -3563,7 +3680,6 @@ class ModVersionChangeDialog(QDialog):
                 return f
         return files[0] if files else None
 
-    # ---------- ПРИМЕНЕНИЕ ----------
     def on_apply(self):
         if not self.selected_version:
             return
@@ -3637,12 +3753,16 @@ class NewInstanceDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Создание новой сборки")
-        self.setMinimumSize(680, 560)
+        self.setMinimumSize(720, 620)
         self.result_data = None
         self._all_versions = []
         self._fetch_thread = None
+        self.loader_compat_thread = None
+        self.loader_mc_versions = {}  # loader_id -> set | None
+        self._closed = False
         self.init_ui()
         self.load_versions()
+        self._start_loader_compat()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -3661,11 +3781,24 @@ class NewInstanceDialog(QDialog):
         left.addWidget(QLabel("Версия Minecraft:"))
 
         self.version_list = QListWidget()
+        self.version_list.itemSelectionChanged.connect(self._on_mc_selection_changed)
         left.addWidget(self.version_list, 1)
 
-        self.show_snapshots_cb = QCheckBox("Показывать снапшоты")
-        self.show_snapshots_cb.toggled.connect(self._refresh_versions)
-        left.addWidget(self.show_snapshots_cb)
+        types_label = QLabel("Типы версий:")
+        left.addWidget(types_label)
+
+        types_row = QHBoxLayout()
+        types_row.setSpacing(6)
+        self.cb_release = QCheckBox("Релизы")
+        self.cb_release.setChecked(True)
+        self.cb_snapshot = QCheckBox("Снапшоты")
+        self.cb_beta = QCheckBox("Беты")
+        self.cb_alpha = QCheckBox("Альфы")
+        for cb in (self.cb_release, self.cb_snapshot, self.cb_beta, self.cb_alpha):
+            cb.toggled.connect(self._refresh_versions)
+            types_row.addWidget(cb)
+        types_row.addStretch()
+        left.addLayout(types_row)
 
         right = QVBoxLayout()
         right.setSpacing(4)
@@ -3681,7 +3814,7 @@ class NewInstanceDialog(QDialog):
         right.addSpacing(8)
         right.addWidget(QLabel("Загрузчик:"))
         self.loader_combo = QComboBox()
-        self.loader_combo.addItems(["Fabric", "Forge", "NeoForge"])
+        self.loader_combo.addItems(list(MOD_LOADERS.values()))
         right.addWidget(self.loader_combo)
 
         right.addStretch()
@@ -3692,6 +3825,7 @@ class NewInstanceDialog(QDialog):
 
         self.create_btn = QPushButton("Создать")
         self.create_btn.setFixedHeight(28)
+        self.create_btn.setEnabled(False)
         self.create_btn.clicked.connect(self.on_create)
         right.addWidget(self.create_btn)
 
@@ -3703,6 +3837,29 @@ class NewInstanceDialog(QDialog):
         columns.addLayout(left, 1)
         columns.addLayout(right, 1)
         layout.addLayout(columns, 1)
+
+    def _start_loader_compat(self):
+        self.status_label.setText("Проверка совместимости загрузчиков...")
+        self.loader_compat_thread = LoaderCompatFetchThread()
+        self.loader_compat_thread.finished_signal.connect(self._on_loader_compat)
+        self.loader_compat_thread.start()
+
+    def _on_loader_compat(self, result):
+        if self._closed:
+            return
+        if not isinstance(result, dict):
+            return
+        self.loader_mc_versions = result
+
+        all_failed = all(v is None for v in result.values())
+        if all_failed:
+            self.status_label.setText(
+                "Не удалось проверить совместимость загрузчиков — все показаны без фильтра."
+            )
+        else:
+            self.status_label.setText("Список версий и совместимость загружены.")
+
+        self._refresh_loader_combo()
 
     def load_versions(self):
         self.version_list.clear()
@@ -3719,25 +3876,115 @@ class NewInstanceDialog(QDialog):
             self.version_list.clear()
             self.version_list.addItem(f"Ошибка загрузки: {error}")
             self.status_label.setText("Не удалось получить список версий.")
+            self._update_create_button_state()
             return
         self._all_versions = versions
         self._refresh_versions()
 
+    def _selected_types(self):
+        allowed = set()
+        if self.cb_release.isChecked():
+            allowed.add("release")
+        if self.cb_snapshot.isChecked():
+            allowed.add("snapshot")
+        if self.cb_beta.isChecked():
+            allowed.add("old_beta")
+        if self.cb_alpha.isChecked():
+            allowed.add("old_alpha")
+        return allowed
+
     def _refresh_versions(self):
         if not self._all_versions:
             return
-        show_snaps = self.show_snapshots_cb.isChecked()
+
+        allowed = self._selected_types()
+        prev_selected = self._selected_mc_version()
+
+        self.version_list.blockSignals(True)
         self.version_list.clear()
-        for v in self._all_versions:
-            vtype = v.get("type", "")
-            if not show_snaps and vtype != "release":
-                continue
-            if show_snaps and vtype not in ("release", "snapshot"):
-                continue
-            vid = v.get("id")
-            if not vid:
-                continue
-            self.version_list.addItem(vid)
+
+        if not allowed:
+            self.version_list.addItem("Выберите хотя бы один тип версий")
+        else:
+            for v in self._all_versions:
+                vtype = v.get("type", "")
+                if vtype not in allowed:
+                    continue
+                vid = v.get("id")
+                if not vid:
+                    continue
+                self.version_list.addItem(vid)
+
+        # Пытаемся вернуть прежний выбор
+        restored = False
+        if prev_selected:
+            for i in range(self.version_list.count()):
+                item = self.version_list.item(i)
+                if item and item.text() == prev_selected:
+                    self.version_list.setCurrentItem(item)
+                    restored = True
+                    break
+
+        if not restored and self.version_list.count() > 0:
+            first = self.version_list.item(0)
+            if first and not first.text().startswith("Выберите"):
+                self.version_list.setCurrentRow(0)
+
+        self.version_list.blockSignals(False)
+        self._refresh_loader_combo()
+
+    def _on_mc_selection_changed(self):
+        self._refresh_loader_combo()
+
+    def _selected_mc_version(self):
+        item = self.version_list.currentItem()
+        if item is None:
+            return None
+        text = item.text()
+        if (not text
+                or text.startswith("Загрузка")
+                or text.startswith("Ошибка")
+                or text.startswith("Выберите")):
+            return None
+        return text
+
+    def _refresh_loader_combo(self):
+        mc = self._selected_mc_version()
+        prev_text = self.loader_combo.currentText() if self.loader_combo.count() else ""
+
+        if mc is None:
+            # Версия не выбрана — показываем все загрузчики
+            available = [MOD_LOADERS[lid]
+                         for lid in ("vanilla", "fabric", "forge", "neoforge")]
+        else:
+            # Vanilla всегда доступен
+            available = [MOD_LOADERS["vanilla"]]
+            for lid in ("fabric", "forge", "neoforge"):
+                data = self.loader_mc_versions.get(lid)
+                if data is None:
+                    # Данные не пришли — не фильтруем
+                    available.append(MOD_LOADERS[lid])
+                elif mc in data:
+                    available.append(MOD_LOADERS[lid])
+
+        self.loader_combo.blockSignals(True)
+        self.loader_combo.clear()
+        self.loader_combo.addItems(available)
+        if prev_text in available:
+            self.loader_combo.setCurrentText(prev_text)
+        self.loader_combo.blockSignals(False)
+
+        if mc is not None and len(available) == 1:
+            self.status_label.setText(
+                f"Для Minecraft {mc} доступен только режим без загрузчика."
+            )
+
+        self._update_create_button_state()
+
+    def _update_create_button_state(self):
+        mc = self._selected_mc_version()
+        has_loader = self.loader_combo.count() > 0
+        self.create_btn.setEnabled(bool(mc) and has_loader)
 
     def on_create(self):
         item = self.version_list.currentItem()
@@ -3748,7 +3995,10 @@ class NewInstanceDialog(QDialog):
             )
             return
         version = item.text()
-        if not version or version.startswith("Загрузка") or version.startswith("Ошибка"):
+        if (not version
+                or version.startswith("Загрузка")
+                or version.startswith("Ошибка")
+                or version.startswith("Выберите")):
             QMessageBox.warning(
                 self, "Версия не выбрана",
                 "Выберите версию Minecraft из списка слева."
@@ -3782,6 +4032,12 @@ class NewInstanceDialog(QDialog):
             "loader": loader_id,
         }
         self.accept()
+
+    def closeEvent(self, event):
+        self._closed = True
+        if self.loader_compat_thread and self.loader_compat_thread.isRunning():
+            self.loader_compat_thread.stop()
+        event.accept()
 
 
 # ============================================================
@@ -4546,7 +4802,6 @@ class DotLauncher(QMainWindow):
 
     # ---------- МАНИФЕСТ МОДОВ ----------
     def _ensure_manifest_for_current_instance(self):
-        """Если для текущей сборки не проставлен modsVerIdentified — запускает индексацию."""
         if not self.current_instance or self.current_instance not in self.instances:
             return
         inst = self.instances[self.current_instance]
@@ -4564,7 +4819,6 @@ class DotLauncher(QMainWindow):
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
 
         if not os.path.isdir(minecraft_dir):
-            # Нечего индексировать (сборка ещё не установлена)
             inst["modsVerIdentified"] = True
             self.save_instances()
             return
@@ -4597,7 +4851,6 @@ class DotLauncher(QMainWindow):
                     f"сборки «{inst['name']}»: {error}"
                 )
 
-        # Возможно, пользователь уже выбрал другую сборку, которая ещё не проиндексирована
         if (self.current_instance
                 and self.current_instance != instance_id
                 and self.current_instance in self.instances
@@ -4606,10 +4859,6 @@ class DotLauncher(QMainWindow):
 
     def _get_or_build_manifest_entry(self, instance_dir, mod_path, filename,
                                      loader_id, disabled):
-        """
-        Возвращает запись манифеста для файла (с валидацией sha1).
-        Если записи нет или хэш изменился — строит заново и сохраняет.
-        """
         manifest = load_mod_manifest(instance_dir)
         entry = manifest.get("mods", {}).get(filename)
 
@@ -4625,7 +4874,6 @@ class DotLauncher(QMainWindow):
               and entry["sha1"] != actual_sha1):
             need_rebuild = True
         elif entry.get("disabled", False) != bool(disabled):
-            # Синхронизируем флаг, если файл переехал между папками
             entry["disabled"] = bool(disabled)
             merge_manifest_entry(manifest, filename, entry)
             try:
@@ -5019,7 +5267,6 @@ class DotLauncher(QMainWindow):
             QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
             return
 
-        # Если идёт индексация — попросим подождать, чтобы не пересекаться
         if self.manifest_rebuild_thread and self.manifest_rebuild_thread.isRunning():
             QMessageBox.information(
                 self, "Подождите",
@@ -5040,7 +5287,6 @@ class DotLauncher(QMainWindow):
             )
             return
 
-        # Достаём/строим запись манифеста
         entry = self._get_or_build_manifest_entry(
             instance_dir, mod_path, filename,
             inst.get("loader", "fabric"), disabled=False
@@ -5055,7 +5301,6 @@ class DotLauncher(QMainWindow):
             self.log(
                 f"[dotLauncher] Версия мода «{filename}» изменена."
             )
-            # Сбрасываем флаг — состав модов изменился
             if self.current_instance in self.instances:
                 self.instances[self.current_instance]["modsVerIdentified"] = False
                 self.save_instances()
@@ -5123,7 +5368,6 @@ class DotLauncher(QMainWindow):
             )
             return
 
-        # Обновляем манифест
         try:
             manifest = load_mod_manifest(instance_dir)
             remove_manifest_entry(manifest, filename)
@@ -5169,10 +5413,15 @@ class DotLauncher(QMainWindow):
                 return
             self.current_instance = instance_id
             self.instance_name_label.setText(inst["name"])
-            loader_name = MOD_LOADERS.get(inst["loader"], inst["loader"])
-            ver_text = f"{loader_name} {inst['version']}"
-            if inst.get("loader_version"):
-                ver_text += f" (loader {inst['loader_version']})"
+
+            if inst.get("loader") == VANILLA_LOADER_ID:
+                ver_text = f"Minecraft {inst['version']} (без загрузчика)"
+            else:
+                loader_name = MOD_LOADERS.get(inst["loader"], inst["loader"])
+                ver_text = f"{loader_name} {inst['version']}"
+                if inst.get("loader_version"):
+                    ver_text += f" (loader {inst['loader_version']})"
+
             self.instance_version_label.setText(ver_text)
             self.drop_zone.setVisible(False)
             self.instance_info.setVisible(True)
@@ -5182,7 +5431,6 @@ class DotLauncher(QMainWindow):
             if self.mods_expanded:
                 self._populate_mods_list()
 
-            # Ленивая миграция: если манифест модов ещё не построен — построим
             self._ensure_manifest_for_current_instance()
 
     # ---------- РАЗВОРОТ СБОРКИ / УПРАВЛЕНИЕ МОДАМИ ----------
@@ -5326,7 +5574,6 @@ class DotLauncher(QMainWindow):
             state = "выключен" if not disabled else "включён"
             self.log(f"[dotLauncher] Мод {target_name} {state}.")
 
-            # Синхронизируем манифест с новым состоянием
             try:
                 manifest = load_mod_manifest(instance_dir)
                 entry = manifest.get("mods", {}).get(filename)
@@ -5498,6 +5745,7 @@ class DotLauncher(QMainWindow):
 
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
+        is_vanilla = (inst.get("loader") == VANILLA_LOADER_ID)
 
         window = ModrinthWindow(
             inst["name"],
@@ -5505,11 +5753,11 @@ class DotLauncher(QMainWindow):
             inst["version"],
             instance_dir,
             parent=self,
+            vanilla=is_vanilla,
         )
         window.exec()
         self.log(f"[dotLauncher] Modrinth: окно закрыто для «{inst['name']}».")
 
-        # Если были скачаны моды — инвалидируем манифест и запустим переиндексацию
         if getattr(window, "downloaded_mods", False):
             if self.current_instance in self.instances:
                 self.instances[self.current_instance]["modsVerIdentified"] = False
