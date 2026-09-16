@@ -4,7 +4,7 @@
 dotLauncher — минималистичный лаунчер Minecraft для Fabric/Forge/NeoForge сборок.
 Один файл, PyQt6 + minecraft-launcher-lib. Поддержка Modrinth, .mrpack,
 экспорт и импорт .zip и .dotpack.
-Стилизация: Windows 98.
+Сменные темы интерфейса: Классика (Win98) / Windows XP Luna (с выбором акцента).
 """
 
 import sys
@@ -44,14 +44,14 @@ except ImportError:
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QPushButton, QLineEdit,
-    QComboBox, QTextEdit, QFileDialog, QInputDialog, QMessageBox,
+    QGridLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QLineEdit, QComboBox, QTextEdit, QFileDialog, QInputDialog, QMessageBox,
     QSplitter, QFrame, QProgressBar, QSpinBox, QCheckBox,
     QDialog, QStackedWidget, QScrollArea, QMenu, QRadioButton,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QStandardPaths,
-    QPoint, QBuffer, QIODevice, QTimer,
+    QPoint, QBuffer, QIODevice, QTimer, QEvent, QObject,
 )
 from PyQt6.QtGui import (
     QFont, QPalette, QColor, QDragEnterEvent, QDropEvent,
@@ -61,7 +61,6 @@ from PyQt6.QtGui import (
 import minecraft_launcher_lib
 import minecraft_launcher_lib.runtime
 
-# Опциональный модуль .mrpack (доступен в minecraft-launcher-lib 7.2+)
 try:
     import minecraft_launcher_lib.mrpack as _mrpack_module
     MRPACK_AVAILABLE = True
@@ -76,6 +75,7 @@ except Exception:
 APP_NAME = "dotLauncher"
 LAUNCHER_VERSION = "0.5"
 INSTANCES_DB = "instances.json"
+THEME_CONFIG_FILENAME = "theme.json"
 
 AUTHLIB_INJECTOR_VERSION = "1.2.5"
 AUTHLIB_INJECTOR_URL = (
@@ -104,14 +104,12 @@ LOADER_TO_MODRINTH = {
     "neoforge": "neoforge",
 }
 
-# Соответствие ключей dependencies из modrinth.index.json
 MRPACK_LOADER_KEYS = {
     "fabric-loader": "fabric",
     "forge": "forge",
     "neoforge": "neoforge",
 }
 
-# Известные, но неподдерживаемые загрузчики (для информативного сообщения)
 MRPACK_UNSUPPORTED_KEYS = {
     "quilt-loader": "Quilt",
     "rift-loader": "Rift",
@@ -119,7 +117,6 @@ MRPACK_UNSUPPORTED_KEYS = {
     "legacy-fabric": "Legacy Fabric",
 }
 
-# Формат собственного экспорта
 DOTPACK_FORMAT = "dotpack"
 DOTPACK_FORMAT_VERSION = 1
 ZIP_FORMAT = "dotlauncher-zip"
@@ -139,7 +136,6 @@ SKIP_DIRS = {
     "disabledMods",
 }
 
-# --- Манифест идентификации модов ---
 MANIFEST_DIR_NAME = ".dotlauncher"
 MANIFEST_FILE_NAME = "mods.json"
 MANIFEST_VERSION = 1
@@ -246,9 +242,10 @@ APP_ICON_B64 = (
     "VJHwAAAABJRU5ErkJggg=="
 )
 
+# Глобальный фильтр — держим ссылку, чтобы не собрался GC
+_combo_theme_filter = None
 
 def load_app_icon():
-    """Возвращает QIcon, декодированный из APP_ICON_B64."""
     if not APP_ICON_B64 or APP_ICON_B64 == "ВСТАВЬ СЮДА BASE64":
         return QIcon()
     try:
@@ -262,13 +259,13 @@ def load_app_icon():
 
 
 # ============================================================
-#  ГЕНЕРАЦИЯ WIN98-ИКОНОК (Base64 data URL)
+#  ГЕНЕРАЦИЯ ИКОНОК
 # ============================================================
 _ICON_CACHE = {}
 
 
-def _win98_icon(kind, w, h, bg="#c0c0c0"):
-    key = (kind, w, h, bg)
+def _win98_icon(kind, w, h, bg="#c0c0c0", fg="#000000"):
+    key = (kind, w, h, bg, fg)
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
 
@@ -277,7 +274,7 @@ def _win98_icon(kind, w, h, bg="#c0c0c0"):
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(0, 0, 0))
+    p.setBrush(QColor(fg))
 
     if kind == "down":
         p.drawPolygon(QPolygon([
@@ -296,17 +293,12 @@ def _win98_icon(kind, w, h, bg="#c0c0c0"):
             QPoint(0, 0), QPoint(0, h - 1), QPoint(w - 1, h // 2)
         ]))
     elif kind == "check":
-        pen = QPen(QColor(0, 0, 0))
+        pen = QPen(QColor(fg))
         pen.setWidth(2)
         pen.setCapStyle(Qt.PenCapStyle.SquareCap)
         p.setPen(pen)
         p.drawLine(2, h // 2, w // 2, h - 3)
         p.drawLine(w // 2, h - 3, w - 2, 2)
-    elif kind == "radio":
-        p.setBrush(QColor(0, 0, 0))
-        p.drawEllipse(4, 4, w - 8, h - 8)
-    elif kind == "indeterminate":
-        p.drawRect(w // 3, h // 3, w - 2 * (w // 3), h - 2 * (h // 3))
 
     p.end()
 
@@ -321,19 +313,354 @@ def _win98_icon(kind, w, h, bg="#c0c0c0"):
     return url
 
 
-def build_win98_qss():
+# ============================================================
+#  ЦВЕТОВЫЕ УТИЛИТЫ
+# ============================================================
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _rgb_to_hex(r, g, b):
+    r = max(0, min(255, int(r)))
+    g = max(0, min(255, int(g)))
+    b = max(0, min(255, int(b)))
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _mix(c1, c2, t):
+    r1, g1, b1 = _hex_to_rgb(c1)
+    r2, g2, b2 = _hex_to_rgb(c2)
+    return _rgb_to_hex(
+        r1 * (1 - t) + r2 * t,
+        g1 * (1 - t) + g2 * t,
+        b1 * (1 - t) + b2 * t,
+    )
+
+
+def _is_valid_hex(s):
+    return bool(re.match(r'^#[0-9A-Fa-f]{6}$', s or ""))
+
+
+# ============================================================
+#  THEME MANAGER
+# ============================================================
+class ThemeManager:
+    FAMILY_WIN98 = "win98"
+    FAMILY_XP = "xp"
+
+    XP_PRESETS = [
+        ("Синий (XP)",    "#3B8BEA"),
+        ("Оливковый",     "#8DA235"),
+        ("Серебристый",   "#7A7A7A"),
+        ("Royal",         "#1F4E79"),
+        ("Зелёный",       "#3F9F3F"),
+        ("Красный",       "#C0392B"),
+        ("Фиолетовый",    "#8E44AD"),
+        ("Оранжевый",     "#E67E22"),
+        ("Розовый",       "#D6438B"),
+        ("Бирюзовый",     "#2AA6A6"),
+    ]
+    XP_DEFAULT_ACCENT = "#3B8BEA"
+
+    _instance = None
+
+    @classmethod
+    def get(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self.family = self.FAMILY_WIN98
+        self.xp_accent = self.XP_DEFAULT_ACCENT
+        self._listeners = []
+        self._config_path = None
+
+    def load_from_disk(self, config_dir):
+        self._config_path = os.path.join(config_dir, THEME_CONFIG_FILENAME)
+        if not os.path.isfile(self._config_path):
+            return
+        try:
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        fam = data.get("family")
+        if fam in (self.FAMILY_WIN98, self.FAMILY_XP):
+            self.family = fam
+        acc = data.get("xp_accent")
+        if isinstance(acc, str) and _is_valid_hex(acc):
+            self.xp_accent = acc.upper()
+
+    def save_to_disk(self):
+        if not self._config_path:
+            return
+        try:
+            with open(self._config_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"family": self.family, "xp_accent": self.xp_accent},
+                    f, ensure_ascii=False, indent=2,
+                )
+        except Exception:
+            pass
+
+    def add_listener(self, cb):
+        if cb not in self._listeners:
+            self._listeners.append(cb)
+
+    def remove_listener(self, cb):
+        try:
+            self._listeners.remove(cb)
+        except ValueError:
+            pass
+
+    def _notify(self):
+        for cb in list(self._listeners):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def set_theme(self, family, xp_accent=None):
+        changed = False
+        if family in (self.FAMILY_WIN98, self.FAMILY_XP) and family != self.family:
+            self.family = family
+            changed = True
+        if xp_accent and _is_valid_hex(xp_accent) and xp_accent.upper() != self.xp_accent:
+            self.xp_accent = xp_accent.upper()
+            changed = True
+        if changed:
+            self.save_to_disk()
+            self._notify()
+        return changed
+
+    def colors(self):
+        if self.family == self.FAMILY_WIN98:
+            return {
+                "textNormal":  "#000000",
+                "textMuted":   "#808080",
+                "textWarning": "#800000",
+                "textHint":    "#404040",
+                "disabledFg":  "#808080",
+                "enabledFg":   "#000000",
+            }
+        return {
+            "textNormal":  "#003366",
+            "textMuted":   "#6A7A98",
+            "textWarning": "#8B0000",
+            "textHint":    "#2A4A7C",
+            "disabledFg":  "#6A7A98",
+            "enabledFg":   "#003366",
+        }
+
+    def qss(self):
+        if self.family == self.FAMILY_WIN98:
+            return _build_win98_qss()
+        return _build_xp_qss(self.xp_accent)
+
+    def palette(self):
+        if self.family == self.FAMILY_WIN98:
+            return _build_win98_palette()
+        return _build_xp_palette(self.xp_accent)
+
+    def apply(self, app):
+        app.setStyleSheet(self.qss())
+        app.setPalette(self.palette())
+        try:
+            for w in app.allWidgets():
+                if isinstance(w, QComboBox):
+                    _apply_combo_popup_theme(w)
+        except Exception:
+            pass
+
+
+# ============================================================
+#  QSS-БИЛДЕРЫ
+# ============================================================
+def _build_win98_qss():
     icons = {
-        "ICON_DOWN":   _win98_icon("down",   7, 4, bg="#c0c0c0"),
-        "ICON_UP":     _win98_icon("up",     7, 4, bg="#c0c0c0"),
-        "ICON_LEFT":   _win98_icon("left",   4, 7, bg="#c0c0c0"),
-        "ICON_RIGHT":  _win98_icon("right",  4, 7, bg="#c0c0c0"),
-        "ICON_CHECK":  _win98_icon("check", 13, 13, bg="#ffffff"),
+        "ICON_DOWN":   _win98_icon("down",   7, 4, bg="#c0c0c0", fg="#000000"),
+        "ICON_UP":     _win98_icon("up",     7, 4, bg="#c0c0c0", fg="#000000"),
+        "ICON_LEFT":   _win98_icon("left",   4, 7, bg="#c0c0c0", fg="#000000"),
+        "ICON_RIGHT":  _win98_icon("right",  4, 7, bg="#c0c0c0", fg="#000000"),
+        "ICON_CHECK":  _win98_icon("check", 13, 13, bg="#ffffff", fg="#000000"),
     }
     qss = WIN98_QSS_TEMPLATE
     for name, url in icons.items():
         qss = qss.replace(f"__{name}__", url)
     return qss
 
+
+def _xp_tokens(accent):
+    a = accent.upper()
+    W = "#FFFFFF"
+    B = "#000000"
+    return {
+        "ACCENT_LIGHT":    _mix(a, W, 0.55),
+        "ACCENT":          a,
+        "ACCENT_DARK":     _mix(a, B, 0.20),
+        "ACCENT_DARKEST":  _mix(a, B, 0.55),
+        "ACCENT_BORDER":   _mix(a, B, 0.70),
+        "ACCENT_HL1":      _mix(a, W, 0.75),
+        "ACCENT_HL2":      _mix(a, W, 0.45),
+        "ACCENT_HL3":      _mix(a, W, 0.10),
+        "BORDER_FOCUS":    _mix(a, B, 0.10),
+        "SELECT_BG":       _mix(a, B, 0.25),
+        "COMBO_SELECT_BG": _mix(a, W, 0.78),
+        "COMBO_SELECT_FG": _mix(a, B, 0.35),
+        "BG":              _mix(a, W, 0.90),
+        "BG2":             _mix(a, W, 0.86),
+        "TEXT_ON_ACCENT":  "#FFFFFF",
+    }
+
+
+def _build_xp_qss(accent):
+    tokens = _xp_tokens(accent)
+    dark = _mix(accent, "#000000", 0.55)
+    icons = {
+        "ICON_DOWN":   _win98_icon("down",   7, 4, bg=tokens["BG"], fg=dark),
+        "ICON_UP":     _win98_icon("up",     7, 4, bg=tokens["BG"], fg=dark),
+        "ICON_LEFT":   _win98_icon("left",   4, 7, bg=tokens["BG"], fg=dark),
+        "ICON_RIGHT":  _win98_icon("right",  4, 7, bg=tokens["BG"], fg=dark),
+        "ICON_CHECK":  _win98_icon("check",  9, 9, bg="#FFFFFF",    fg=dark),
+    }
+    qss = XP_QSS_TEMPLATE
+    for name, url in icons.items():
+        qss = qss.replace(f"__{name}__", url)
+    for key, val in tokens.items():
+        qss = qss.replace(f"{{{{{key}}}}}", val)
+    return qss
+
+
+def _build_win98_palette():
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window,           QColor(192, 192, 192))
+    pal.setColor(QPalette.ColorRole.WindowText,       QColor(0, 0, 0))
+    pal.setColor(QPalette.ColorRole.Base,             QColor(255, 255, 255))
+    pal.setColor(QPalette.ColorRole.AlternateBase,    QColor(232, 232, 232))
+    pal.setColor(QPalette.ColorRole.ToolTipBase,      QColor(255, 255, 225))
+    pal.setColor(QPalette.ColorRole.ToolTipText,      QColor(0, 0, 0))
+    pal.setColor(QPalette.ColorRole.Text,             QColor(0, 0, 0))
+    pal.setColor(QPalette.ColorRole.Button,           QColor(192, 192, 192))
+    pal.setColor(QPalette.ColorRole.ButtonText,       QColor(0, 0, 0))
+    pal.setColor(QPalette.ColorRole.BrightText,       QColor(255, 0, 0))
+    pal.setColor(QPalette.ColorRole.Link,             QColor(0, 0, 255))
+    pal.setColor(QPalette.ColorRole.Highlight,        QColor(0, 0, 128))
+    pal.setColor(QPalette.ColorRole.HighlightedText,  QColor(255, 255, 255))
+    return pal
+
+
+def _build_xp_palette(accent):
+    t = _xp_tokens(accent)
+    # Используем ОЧЕНЬ СВЕТЛЫЙ акцент для системного Highlight.
+    # Тёмное выделение теперь задаётся только через QSS-правила
+    # (QListWidget::item:selected и т.п.), а попапы QComboBox берут светлый
+    # цвет из палитры. Это устраняет чёрный фон в выпадающих списках.
+    light_bg = QColor(t["COMBO_SELECT_BG"])
+    light_fg = QColor(t["COMBO_SELECT_FG"])
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window,           QColor(t["BG"]))
+    pal.setColor(QPalette.ColorRole.WindowText,       QColor("#003366"))
+    pal.setColor(QPalette.ColorRole.Base,             QColor(255, 255, 255))
+    pal.setColor(QPalette.ColorRole.AlternateBase,    QColor(t["BG2"]))
+    pal.setColor(QPalette.ColorRole.ToolTipBase,      QColor(255, 255, 225))
+    pal.setColor(QPalette.ColorRole.ToolTipText,      QColor(0, 51, 102))
+    pal.setColor(QPalette.ColorRole.Text,             QColor(0, 51, 102))
+    pal.setColor(QPalette.ColorRole.Button,           QColor(t["BG"]))
+    pal.setColor(QPalette.ColorRole.ButtonText,       QColor("#003366"))
+    pal.setColor(QPalette.ColorRole.BrightText,       QColor(255, 0, 0))
+    pal.setColor(QPalette.ColorRole.Link,             QColor(t["BORDER_FOCUS"]))
+    pal.setColor(QPalette.ColorRole.Highlight,        light_bg)
+    pal.setColor(QPalette.ColorRole.HighlightedText,  light_fg)
+    return pal
+    
+def _apply_combo_popup_theme(combo):
+    """
+    Прямо применить стили и палитру к попапу QComboBox.
+    Нужно потому, что попап — отдельное top-level окно, и
+    QSS-селектор `QComboBox QAbstractItemView` до него долетает не всегда.
+    """
+    if not isinstance(combo, QComboBox):
+        return
+    try:
+        view = combo.view()
+    except Exception:
+        return
+    if view is None:
+        return
+
+    tm = ThemeManager.get()
+    if tm.family == ThemeManager.FAMILY_WIN98:
+        bg = "#FFFFFF"
+        fg = "#000000"
+        hover_bg = "#D4D0C8"
+        sel_bg = "#000080"
+        sel_fg = "#FFFFFF"
+        border = "#404040"
+    else:
+        t = _xp_tokens(tm.xp_accent)
+        bg = "#FFFFFF"
+        fg = "#003366"
+        hover_bg = t["ACCENT_HL1"]
+        sel_bg = t["COMBO_SELECT_BG"]
+        sel_fg = t["COMBO_SELECT_FG"]
+        border = "#7F9DB9"
+
+    qss = (
+        "QAbstractItemView {"
+        f"  background-color: {bg};"
+        f"  color: {fg};"
+        f"  border: 1px solid {border};"
+        "  outline: 0;"
+        f"  selection-background-color: {sel_bg};"
+        f"  selection-color: {sel_fg};"
+        "}"
+        "QAbstractItemView::item {"
+        f"  background-color: {bg};"
+        f"  color: {fg};"
+        "  padding: 3px 6px;"
+        "  min-height: 18px;"
+        "  border: none;"
+        "}"
+        "QAbstractItemView::item:hover {"
+        f"  background-color: {hover_bg};"
+        f"  color: {fg};"
+        "}"
+        "QAbstractItemView::item:selected,"
+        "QAbstractItemView::item:selected:active,"
+        "QAbstractItemView::item:selected:!active {"
+        f"  background-color: {sel_bg};"
+        f"  color: {sel_fg};"
+        "}"
+    )
+    view.setStyleSheet(qss)
+
+    p = view.palette()
+    p.setColor(QPalette.ColorRole.Highlight,        QColor(sel_bg))
+    p.setColor(QPalette.ColorRole.HighlightedText,  QColor(sel_fg))
+    p.setColor(QPalette.ColorRole.Base,             QColor(bg))
+    p.setColor(QPalette.ColorRole.AlternateBase,    QColor(bg))
+    p.setColor(QPalette.ColorRole.Text,             QColor(fg))
+    p.setColor(QPalette.ColorRole.Window,           QColor(bg))
+    p.setColor(QPalette.ColorRole.WindowText,       QColor(fg))
+    view.setPalette(p)
+    view.setAutoFillBackground(True)
+
+
+class _ComboThemeFilter(QObject):
+    """
+    Ловит появление/полировку QComboBox и перекрашивает попап.
+    Нужен для комбобоксов в диалогах, созданных после применения темы.
+    """
+    def eventFilter(self, obj, event):
+        try:
+            if isinstance(obj, QComboBox):
+                if event.type() in (QEvent.Type.Show, QEvent.Type.Polish):
+                    _apply_combo_popup_theme(obj)
+        except Exception:
+            pass
+        return False
 
 # ============================================================
 #  WIN98 THEME (шаблон QSS)
@@ -357,6 +684,25 @@ QLabel {
 QFrame {
     background-color: #c0c0c0;
     border: none;
+}
+
+QFrame[role="card"] {
+    background-color: #c0c0c0;
+    border: 1px solid #808080;
+}
+
+#resultsWidget, #optionalsWidget {
+    background-color: #ffffff;
+}
+
+#dropZone {
+    background-color: #ffffff;
+    color: #000000;
+    border-top: 2px solid #404040;
+    border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff;
+    border-right: 2px solid #ffffff;
+    padding: 30px;
 }
 
 QSplitter {
@@ -442,16 +788,8 @@ QSpinBox::down-button {
     border-bottom: 2px solid #404040;
     border-right: 2px solid #404040;
 }
-QSpinBox::up-arrow {
-    image: __ICON_UP__;
-    width: 7px;
-    height: 4px;
-}
-QSpinBox::down-arrow {
-    image: __ICON_DOWN__;
-    width: 7px;
-    height: 4px;
-}
+QSpinBox::up-arrow  { image: __ICON_UP__;   width: 7px; height: 4px; }
+QSpinBox::down-arrow{ image: __ICON_DOWN__; width: 7px; height: 4px; }
 
 QComboBox {
     background-color: #ffffff;
@@ -473,11 +811,7 @@ QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: center right;
 }
-QComboBox::down-arrow {
-    image: __ICON_DOWN__;
-    width: 7px;
-    height: 4px;
-}
+QComboBox::down-arrow { image: __ICON_DOWN__; width: 7px; height: 4px; }
 QComboBox QAbstractItemView {
     background-color: #ffffff;
     color: #000000;
@@ -495,15 +829,8 @@ QListWidget {
     border-right: 2px solid #ffffff;
     outline: none;
 }
-QListWidget::item {
-    background-color: #ffffff;
-    color: #000000;
-    padding: 2px 4px;
-}
-QListWidget::item:selected {
-    background-color: #000080;
-    color: #ffffff;
-}
+QListWidget::item { background-color: #ffffff; color: #000000; padding: 2px 4px; }
+QListWidget::item:selected { background-color: #000080; color: #ffffff; }
 
 QTextEdit {
     background-color: #ffffff;
@@ -518,221 +845,521 @@ QTextEdit {
     selection-color: #ffffff;
 }
 
-QCheckBox {
-    color: #000000;
-    spacing: 6px;
-    background-color: transparent;
-}
+QCheckBox { color: #000000; spacing: 6px; background-color: transparent; }
 QCheckBox::indicator {
-    width: 13px;
-    height: 13px;
-    background-color: #ffffff;
-    border-top: 2px solid #404040;
-    border-left: 2px solid #404040;
-    border-bottom: 2px solid #ffffff;
-    border-right: 2px solid #ffffff;
+    width: 13px; height: 13px; background-color: #ffffff;
+    border-top: 2px solid #404040; border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff; border-right: 2px solid #ffffff;
 }
 QCheckBox::indicator:checked {
     background-color: #000080;
-    border-top: 2px solid #404040;
-    border-left: 2px solid #404040;
-    border-bottom: 2px solid #ffffff;
-    border-right: 2px solid #ffffff;
+    border-top: 2px solid #404040; border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff; border-right: 2px solid #ffffff;
 }
-QCheckBox::indicator:disabled {
-    background-color: #c0c0c0;
-}
-QCheckBox::indicator:checked:disabled {
-    background-color: #808080;
-}
+QCheckBox::indicator:disabled { background-color: #c0c0c0; }
+QCheckBox::indicator:checked:disabled { background-color: #808080; }
 
-QRadioButton {
-    color: #000000;
-    spacing: 6px;
-    background-color: transparent;
-    padding: 2px 0;
-}
+QRadioButton { color: #000000; spacing: 6px; background-color: transparent; padding: 2px 0; }
 QRadioButton::indicator {
-    width: 12px;
-    height: 12px;
-    background-color: #ffffff;
-    border-top: 2px solid #404040;
-    border-left: 2px solid #404040;
-    border-bottom: 2px solid #ffffff;
-    border-right: 2px solid #ffffff;
+    width: 12px; height: 12px; background-color: #ffffff;
+    border-top: 2px solid #404040; border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff; border-right: 2px solid #ffffff;
     border-radius: 7px;
 }
 QRadioButton::indicator:checked {
     background-color: #000080;
-    border-top: 2px solid #404040;
-    border-left: 2px solid #404040;
-    border-bottom: 2px solid #ffffff;
-    border-right: 2px solid #ffffff;
+    border-top: 2px solid #404040; border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff; border-right: 2px solid #ffffff;
     border-radius: 7px;
 }
-QRadioButton::indicator:disabled {
-    background-color: #c0c0c0;
-}
+QRadioButton::indicator:disabled { background-color: #c0c0c0; }
 
 QProgressBar {
-    background-color: #c0c0c0;
-    color: #000000;
-    border-top: 2px solid #404040;
-    border-left: 2px solid #404040;
-    border-bottom: 2px solid #ffffff;
-    border-right: 2px solid #ffffff;
-    text-align: center;
-    min-height: 18px;
+    background-color: #c0c0c0; color: #000000;
+    border-top: 2px solid #404040; border-left: 2px solid #404040;
+    border-bottom: 2px solid #ffffff; border-right: 2px solid #ffffff;
+    text-align: center; min-height: 18px;
 }
-QProgressBar::chunk {
-    background-color: #000080;
-}
+QProgressBar::chunk { background-color: #000080; }
 
 QScrollBar:vertical {
-    background-color: #c0c0c0;
-    width: 16px;
-    margin: 16px 0 16px 0;
-    border: none;
+    background-color: #c0c0c0; width: 16px; margin: 16px 0 16px 0; border: none;
 }
 QScrollBar::handle:vertical {
     background-color: #c0c0c0;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-bottom: 2px solid #404040;
-    border-right: 2px solid #404040;
+    border-top: 2px solid #ffffff; border-left: 2px solid #ffffff;
+    border-bottom: 2px solid #404040; border-right: 2px solid #404040;
     min-height: 16px;
 }
 QScrollBar::add-line:vertical {
     background-color: #c0c0c0;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-bottom: 2px solid #404040;
-    border-right: 2px solid #404040;
-    height: 16px;
-    subcontrol-position: bottom;
-    subcontrol-origin: margin;
+    border-top: 2px solid #ffffff; border-left: 2px solid #ffffff;
+    border-bottom: 2px solid #404040; border-right: 2px solid #404040;
+    height: 16px; subcontrol-position: bottom; subcontrol-origin: margin;
 }
 QScrollBar::sub-line:vertical {
     background-color: #c0c0c0;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-bottom: 2px solid #404040;
-    border-right: 2px solid #404040;
-    height: 16px;
-    subcontrol-position: top;
-    subcontrol-origin: margin;
+    border-top: 2px solid #ffffff; border-left: 2px solid #ffffff;
+    border-bottom: 2px solid #404040; border-right: 2px solid #404040;
+    height: 16px; subcontrol-position: top; subcontrol-origin: margin;
 }
-QScrollBar::up-arrow:vertical {
-    image: __ICON_UP__;
-    width: 7px;
-    height: 4px;
-}
-QScrollBar::down-arrow:vertical {
-    image: __ICON_DOWN__;
-    width: 7px;
-    height: 4px;
-}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-    background-color: #c0c0c0;
-}
+QScrollBar::up-arrow:vertical   { image: __ICON_UP__;   width: 7px; height: 4px; }
+QScrollBar::down-arrow:vertical { image: __ICON_DOWN__; width: 7px; height: 4px; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background-color: #c0c0c0; }
 
 QScrollBar:horizontal {
-    background-color: #c0c0c0;
-    height: 16px;
-    margin: 0 16px 0 16px;
-    border: none;
+    background-color: #c0c0c0; height: 16px; margin: 0 16px 0 16px; border: none;
 }
 QScrollBar::handle:horizontal {
     background-color: #c0c0c0;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-bottom: 2px solid #404040;
-    border-right: 2px solid #404040;
+    border-top: 2px solid #ffffff; border-left: 2px solid #ffffff;
+    border-bottom: 2px solid #404040; border-right: 2px solid #404040;
     min-width: 16px;
 }
 QScrollBar::add-line:horizontal {
     background-color: #c0c0c0;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-bottom: 2px solid #404040;
-    border-right: 2px solid #404040;
-    width: 16px;
-    subcontrol-position: right;
-    subcontrol-origin: margin;
+    border-top: 2px solid #ffffff; border-left: 2px solid #ffffff;
+    border-bottom: 2px solid #404040; border-right: 2px solid #404040;
+    width: 16px; subcontrol-position: right; subcontrol-origin: margin;
 }
 QScrollBar::sub-line:horizontal {
     background-color: #c0c0c0;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-bottom: 2px solid #404040;
-    border-right: 2px solid #404040;
-    width: 16px;
-    subcontrol-position: left;
-    subcontrol-origin: margin;
+    border-top: 2px solid #ffffff; border-left: 2px solid #ffffff;
+    border-bottom: 2px solid #404040; border-right: 2px solid #404040;
+    width: 16px; subcontrol-position: left; subcontrol-origin: margin;
 }
-QScrollBar::left-arrow:horizontal {
-    image: __ICON_LEFT__;
-    width: 4px;
-    height: 7px;
-}
-QScrollBar::right-arrow:horizontal {
-    image: __ICON_RIGHT__;
-    width: 4px;
-    height: 7px;
-}
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
-    background-color: #c0c0c0;
-}
+QScrollBar::left-arrow:horizontal  { image: __ICON_LEFT__;  width: 4px; height: 7px; }
+QScrollBar::right-arrow:horizontal { image: __ICON_RIGHT__; width: 4px; height: 7px; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background-color: #c0c0c0; }
 
-QScrollArea {
-    background-color: #c0c0c0;
-    border: none;
-}
+QScrollArea { background-color: #c0c0c0; border: none; }
 
 QStatusBar {
-    background-color: #c0c0c0;
-    color: #000000;
+    background-color: #c0c0c0; color: #000000;
     border-top: 1px solid #ffffff;
 }
-QStatusBar::item {
-    border: none;
-}
-QStatusBar QLabel {
-    background-color: transparent;
-    border: none;
-}
+QStatusBar::item { border: none; }
+QStatusBar QLabel { background-color: transparent; border: none; }
 
 QMenu {
-    background-color: #c0c0c0;
-    color: #000000;
-    border-top: 2px solid #ffffff;
-    border-left: 2px solid #ffffff;
-    border-bottom: 2px solid #404040;
-    border-right: 2px solid #404040;
+    background-color: #c0c0c0; color: #000000;
+    border-top: 2px solid #ffffff; border-left: 2px solid #ffffff;
+    border-bottom: 2px solid #404040; border-right: 2px solid #404040;
 }
-QMenu::item {
-    background-color: transparent;
-    color: #000000;
-    padding: 3px 24px 3px 20px;
-}
-QMenu::item:selected {
-    background-color: #000080;
-    color: #ffffff;
-}
-QMenu::item:disabled {
-    color: #808080;
-}
-QMenu::separator {
-    height: 1px;
-    background-color: #808080;
-    margin: 3px 2px 3px 2px;
-}
+QMenu::item { background-color: transparent; color: #000000; padding: 3px 24px 3px 20px; }
+QMenu::item:selected { background-color: #000080; color: #ffffff; }
+QMenu::item:disabled { color: #808080; }
+QMenu::separator { height: 1px; background-color: #808080; margin: 3px 2px 3px 2px; }
 
 QToolTip {
-    background-color: #ffffe1;
-    color: #000000;
-    border: 1px solid #000000;
+    background-color: #ffffe1; color: #000000;
+    border: 1px solid #000000; padding: 2px;
+}
+"""
+
+
+# ============================================================
+#  XP LUNA THEME (шаблон QSS с токенами)
+# ============================================================
+XP_QSS_TEMPLATE = """
+* {
+    font-family: "Tahoma", "Trebuchet MS", "Microsoft Sans Serif", sans-serif;
+    font-size: 8pt;
+}
+
+QMainWindow, QDialog, QWidget {
+    background-color: {{BG}};
+    color: #003366;
+}
+
+QLabel { background-color: transparent; color: #003366; }
+
+QLabel[class="groupHeader"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 {{ACCENT_LIGHT}},
+        stop:0.45 {{ACCENT}},
+        stop:0.55 {{ACCENT_DARK}},
+        stop:1.00 {{ACCENT_DARKEST}});
+    color: {{TEXT_ON_ACCENT}};
+    font-weight: bold;
+    padding: 3px 8px;
+    border: 1px solid {{ACCENT_BORDER}};
+    border-radius: 3px;
+}
+
+QLabel[role="hint"]    { color: #2A4A7C; }
+QLabel[role="warning"] { color: #8B0000; }
+QLabel[role="muted"]   { color: #6A7A98; }
+
+QFrame { background-color: {{BG}}; border: none; }
+
+QFrame[role="card"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG2}});
+    border: 1px solid {{ACCENT_BORDER}};
+    border-radius: 3px;
+}
+
+#resultsWidget, #optionalsWidget { background-color: #FFFFFF; }
+
+#dropZone {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG2}});
+    color: #003366;
+    border: 2px dashed {{ACCENT_HL2}};
+    border-radius: 4px;
+    padding: 30px;
+}
+#dropZone:hover {
+    border: 2px dashed {{BORDER_FOCUS}};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{ACCENT_HL1}});
+}
+
+QSplitter { background-color: {{BG}}; border: none; }
+QSplitter::handle { background-color: {{ACCENT_HL2}}; }
+QSplitter::handle:hover { background-color: {{SELECT_BG}}; }
+QSplitter::handle:horizontal { width: 3px; }
+QSplitter::handle:vertical   { height: 3px; }
+
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 {{ACCENT_LIGHT}},
+        stop:0.45 {{ACCENT}},
+        stop:0.55 {{ACCENT_DARK}},
+        stop:1.00 {{ACCENT_DARKEST}});
+    color: {{TEXT_ON_ACCENT}};
+    border: 1px solid {{ACCENT_BORDER}};
+    border-radius: 3px;
+    padding: 3px 12px;
+    min-height: 18px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 {{ACCENT_HL1}},
+        stop:0.45 {{ACCENT_HL2}},
+        stop:0.55 {{ACCENT_HL3}},
+        stop:1.00 {{ACCENT}});
+    border: 1px solid {{BORDER_FOCUS}};
+}
+QPushButton:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 {{ACCENT_DARKEST}},
+        stop:0.45 {{ACCENT_DARK}},
+        stop:1.00 {{ACCENT_LIGHT}});
+    border: 1px solid {{ACCENT_BORDER}};
+    padding-top: 4px; padding-left: 13px;
+    padding-bottom: 2px; padding-right: 11px;
+}
+QPushButton:default { border: 2px solid {{BORDER_FOCUS}}; }
+QPushButton:disabled {
+    color: #C8D2E0;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 {{ACCENT_HL3}}, stop:1 {{ACCENT_HL2}});
+    border: 1px solid {{ACCENT_HL2}};
+}
+
+QLineEdit {
+    background-color: #FFFFFF;
+    color: #003366;
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    padding: 2px 4px;
+    min-height: 16px;
+    selection-background-color: {{SELECT_BG}};
+    selection-color: #FFFFFF;
+}
+QLineEdit:focus { border: 1px solid {{BORDER_FOCUS}}; }
+
+QSpinBox {
+    background-color: #FFFFFF;
+    color: #003366;
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    padding: 2px 18px 2px 4px;
+    min-height: 16px;
+    selection-background-color: {{SELECT_BG}};
+    selection-color: #FFFFFF;
+}
+QSpinBox:focus { border: 1px solid {{BORDER_FOCUS}}; }
+QSpinBox::up-button {
+    subcontrol-origin: padding; subcontrol-position: top right;
+    width: 16px; height: 9px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG}});
+    border-left: 1px solid #7F9DB9;
+    border-top: 1px solid #7F9DB9;
+    border-right: 1px solid #7F9DB9;
+}
+QSpinBox::down-button {
+    subcontrol-origin: padding; subcontrol-position: bottom right;
+    width: 16px; height: 9px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 {{BG}}, stop:1 #FFFFFF);
+    border-left: 1px solid #7F9DB9;
+    border-bottom: 1px solid #7F9DB9;
+    border-right: 1px solid #7F9DB9;
+}
+QSpinBox::up-arrow   { image: __ICON_UP__;   width: 7px; height: 4px; }
+QSpinBox::down-arrow { image: __ICON_DOWN__; width: 7px; height: 4px; }
+
+QComboBox {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG}});
+    color: #003366;
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    padding: 2px 4px;
+    min-height: 16px;
+}
+QComboBox:focus { border: 1px solid {{BORDER_FOCUS}}; }
+QComboBox::drop-down {
+    subcontrol-origin: padding; subcontrol-position: center right;
+    width: 18px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{ACCENT_HL1}});
+    border-left: 1px solid #7F9DB9;
+}
+QComboBox::down-arrow { image: __ICON_DOWN__; width: 7px; height: 4px; }
+
+/* ==========================================================
+   QComboBox — выпадающий список. Явно задаём светлое
+   выделение через ::item:selected, чтобы не бралось тёмное
+   системное из палитры.
+   ========================================================== */
+QComboBox QAbstractItemView,
+QComboBox QListView {
+    background-color: #FFFFFF;
+    color: #003366;
+    border: 1px solid #7F9DB9;
+    outline: 0;
+    show-decoration-selected: 0;
+    selection-background-color: {{COMBO_SELECT_BG}};
+    selection-color: {{COMBO_SELECT_FG}};
+}
+QComboBox QAbstractItemView::item,
+QComboBox QListView::item {
+    background-color: #FFFFFF;
+    color: #003366;
+    padding: 3px 6px;
+    min-height: 18px;
+    border: none;
+}
+QComboBox QAbstractItemView::item:hover,
+QComboBox QListView::item:hover {
+    background-color: {{ACCENT_HL1}};
+    color: {{COMBO_SELECT_FG}};
+}
+QComboBox QAbstractItemView::item:selected,
+QComboBox QListView::item:selected,
+QComboBox QAbstractItemView::item:selected:active,
+QComboBox QListView::item:selected:active,
+QComboBox QAbstractItemView::item:selected:!active,
+QComboBox QListView::item:selected:!active {
+    background-color: {{COMBO_SELECT_BG}};
+    color: {{COMBO_SELECT_FG}};
+}
+
+QListWidget {
+    background-color: #FFFFFF;
+    color: #003366;
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    outline: none;
+    padding: 1px;
+}
+QListWidget::item {
+    background-color: transparent;
+    color: #003366;
+    padding: 2px 4px;
+    border-radius: 2px;
+}
+QListWidget::item:hover { background-color: {{ACCENT_HL1}}; }
+QListWidget::item:selected { background-color: {{SELECT_BG}}; color: #FFFFFF; }
+
+QTextEdit {
+    background-color: #FFFFFF;
+    color: #003366;
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    font-family: "Lucida Console", "Consolas", "Courier New", monospace;
+    font-size: 9pt;
+    selection-background-color: {{SELECT_BG}};
+    selection-color: #FFFFFF;
+}
+
+QCheckBox { color: #003366; spacing: 6px; background-color: transparent; }
+QCheckBox::indicator {
+    width: 13px; height: 13px;
+    background-color: #FFFFFF;
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+}
+QCheckBox::indicator:hover { border: 1px solid {{BORDER_FOCUS}}; }
+QCheckBox::indicator:checked {
+    image: __ICON_CHECK__;
+    background-color: #FFFFFF;
+    border: 1px solid #7F9DB9;
+}
+QCheckBox::indicator:disabled { background-color: {{BG}}; border: 1px solid {{ACCENT_HL2}}; }
+QCheckBox::indicator:checked:disabled { background-color: {{BG}}; border: 1px solid {{ACCENT_HL2}}; }
+
+QRadioButton { color: #003366; spacing: 6px; background-color: transparent; padding: 2px 0; }
+QRadioButton::indicator {
+    width: 12px; height: 12px;
+    background-color: #FFFFFF;
+    border: 1px solid #7F9DB9;
+    border-radius: 7px;
+}
+QRadioButton::indicator:hover { border: 1px solid {{BORDER_FOCUS}}; }
+QRadioButton::indicator:checked {
+    background: qradialgradient(cx:0.5, cy:0.5, radius:0.55,
+        fx:0.5, fy:0.5,
+        stop:0.00 {{ACCENT_DARKEST}},
+        stop:0.45 {{ACCENT_DARKEST}},
+        stop:0.46 #FFFFFF,
+        stop:1.00 #FFFFFF);
+    border: 1px solid #7F9DB9;
+}
+QRadioButton::indicator:disabled { background-color: {{BG}}; border: 1px solid {{ACCENT_HL2}}; }
+
+QProgressBar {
+    background-color: #FFFFFF;
+    color: #003366;
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    text-align: center;
+    min-height: 18px;
+}
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 {{ACCENT_LIGHT}},
+        stop:0.45 {{ACCENT}},
+        stop:0.55 {{ACCENT_DARK}},
+        stop:1.00 {{ACCENT_DARKEST}});
+    border-radius: 1px;
+    margin: 1px;
+}
+
+QScrollBar:vertical {
+    background-color: {{BG}};
+    width: 16px;
+    margin: 16px 0 16px 0;
+    border: 1px solid {{ACCENT_HL2}};
+    border-radius: 2px;
+}
+QScrollBar::handle:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0.00 #FFFFFF,
+        stop:0.45 {{ACCENT_HL1}},
+        stop:0.55 {{ACCENT_HL2}},
+        stop:1.00 {{ACCENT_HL3}});
+    border: 1px solid {{ACCENT_HL3}};
+    border-radius: 2px;
+    min-height: 16px;
+    margin: 1px;
+}
+QScrollBar::handle:vertical:hover {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0.00 #FFFFFF,
+        stop:0.45 {{ACCENT_HL1}},
+        stop:0.55 {{ACCENT_HL2}},
+        stop:1.00 {{ACCENT}});
+}
+QScrollBar::add-line:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG}});
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    height: 16px;
+    subcontrol-position: bottom; subcontrol-origin: margin;
+}
+QScrollBar::sub-line:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG}});
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    height: 16px;
+    subcontrol-position: top; subcontrol-origin: margin;
+}
+QScrollBar::up-arrow:vertical   { image: __ICON_UP__;   width: 7px; height: 4px; }
+QScrollBar::down-arrow:vertical { image: __ICON_DOWN__; width: 7px; height: 4px; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background-color: {{BG}}; }
+
+QScrollBar:horizontal {
+    background-color: {{BG}};
+    height: 16px;
+    margin: 0 16px 0 16px;
+    border: 1px solid {{ACCENT_HL2}};
+    border-radius: 2px;
+}
+QScrollBar::handle:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 #FFFFFF,
+        stop:0.45 {{ACCENT_HL1}},
+        stop:0.55 {{ACCENT_HL2}},
+        stop:1.00 {{ACCENT_HL3}});
+    border: 1px solid {{ACCENT_HL3}};
+    border-radius: 2px;
+    min-width: 16px;
+    margin: 1px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 #FFFFFF,
+        stop:0.45 {{ACCENT_HL1}},
+        stop:0.55 {{ACCENT_HL2}},
+        stop:1.00 {{ACCENT}});
+}
+QScrollBar::add-line:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG}});
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    width: 16px;
+    subcontrol-position: right; subcontrol-origin: margin;
+}
+QScrollBar::sub-line:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 {{BG}});
+    border: 1px solid #7F9DB9;
+    border-radius: 2px;
+    width: 16px;
+    subcontrol-position: left; subcontrol-origin: margin;
+}
+QScrollBar::left-arrow:horizontal  { image: __ICON_LEFT__;  width: 4px; height: 7px; }
+QScrollBar::right-arrow:horizontal { image: __ICON_RIGHT__; width: 4px; height: 7px; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background-color: {{BG}}; }
+
+QScrollArea { background-color: {{BG}}; border: none; }
+
+QStatusBar {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0.00 {{ACCENT}},
+        stop:0.45 {{ACCENT_DARK}},
+        stop:1.00 {{ACCENT_DARKEST}});
+    color: {{TEXT_ON_ACCENT}};
+    border-top: 1px solid {{ACCENT_BORDER}};
+}
+QStatusBar::item { border: none; }
+QStatusBar QLabel { background-color: transparent; color: {{TEXT_ON_ACCENT}}; border: none; }
+
+QMenu {
+    background-color: #FFFFFF;
+    color: #003366;
+    border: 1px solid {{BORDER_FOCUS}};
+    border-radius: 3px;
     padding: 2px;
+}
+QMenu::item { background-color: transparent; color: #003366; padding: 4px 28px 4px 24px; border-radius: 2px; }
+QMenu::item:selected { background-color: {{SELECT_BG}}; color: #FFFFFF; }
+QMenu::item:disabled { color: #A0B0C8; }
+QMenu::separator { height: 1px; background-color: {{ACCENT_HL2}}; margin: 3px 4px 3px 4px; }
+
+QToolTip {
+    background-color: #FFFFE1; color: #003366;
+    border: 1px solid {{BORDER_FOCUS}}; padding: 2px;
 }
 """
 
@@ -800,7 +1427,6 @@ def sha1_file(path):
 
 
 def utc_now_iso():
-    """ISO-8601 UTC с 'Z'."""
     try:
         return datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
@@ -810,7 +1436,6 @@ def utc_now_iso():
 
 
 def format_mod_version_label(vdata):
-    """Формирует метку версии с префиксом [БЕТА]/[АЛЬФА] при необходимости."""
     if not isinstance(vdata, dict):
         return "?"
     vtype = (vdata.get("version_type") or "release").strip().lower()
@@ -819,7 +1444,6 @@ def format_mod_version_label(vdata):
         prefix = "[БЕТА] "
     elif vtype == "alpha":
         prefix = "[АЛЬФА] "
-
     name = (vdata.get("name") or "").strip()
     ver_num = (vdata.get("version_number") or "").strip()
     if not ver_num:
@@ -832,14 +1456,8 @@ def format_mod_version_label(vdata):
 
 
 def migrate_accounts_format(cfg):
-    """
-    Если конфиг в старом формате (единый аккаунт), конвертирует
-    в новый формат со списком accounts. Если уже в новом — валидирует.
-    Возвращает изменённый cfg.
-    """
     if not isinstance(cfg, dict):
         return cfg
-
     accounts = cfg.get("accounts")
     if isinstance(accounts, list) and accounts:
         valid = []
@@ -860,9 +1478,7 @@ def migrate_accounts_format(cfg):
                             "client_token"):
                 cfg.pop(old_key, None)
             return cfg
-
     new_accounts = []
-
     if cfg.get("elyby_username") and cfg.get("elyby_access_token"):
         new_accounts.append({
             "type": "elyby",
@@ -873,19 +1489,10 @@ def migrate_accounts_format(cfg):
             "refresh_token": cfg.get("elyby_refresh_token", "") or "",
             "client_token": cfg.get("client_token", "") or str(uuid.uuid4()),
         })
-
     if cfg.get("username"):
-        new_accounts.append({
-            "type": "offline",
-            "name": cfg["username"],
-        })
-
+        new_accounts.append({"type": "offline", "name": cfg["username"]})
     if not new_accounts:
-        new_accounts.append({
-            "type": "offline",
-            "name": "",
-        })
-
+        new_accounts.append({"type": "offline", "name": ""})
     cfg["accounts"] = new_accounts
     cfg["active_account"] = 0
     for old_key in ("username", "email", "elyby_username", "elyby_uuid",
@@ -921,15 +1528,10 @@ def get_java_major(java_path):
 
 
 def _fallback_java_for_mc(mc_version):
-    """
-    Fallback-таблица: для старых версий, где в JSON нет majorVersion.
-    Возвращает целое число или None.
-    """
     if not mc_version:
         return None
     m = re.match(r'^1\.(\d+)(?:\.(\d+))?', str(mc_version))
     if not m:
-        # Снапшоты и прочее — не берёмся угадывать
         return None
     try:
         minor = int(m.group(1))
@@ -943,19 +1545,11 @@ def _fallback_java_for_mc(mc_version):
     if minor in (18, 19):
         return 17
     if minor == 20:
-        # 1.20.5+ требует Java 21
         return 21 if patch >= 5 else 17
-    # 1.21 и новее — Java 21
     return 21
 
 
 def get_required_java_major(minecraft_dir, mc_version):
-    """
-    Возвращает требуемую major-версию Java для указанной MC-версии
-    или None, если определить не удалось.
-    Сначала читает versions/<mc>/<mc>.json (javaVersion.majorVersion),
-    затем откатывается к таблице.
-    """
     if not mc_version:
         return None
     path = os.path.join(
@@ -1111,11 +1705,9 @@ def parse_toml_mod_info(content, loader):
         data = tomllib.loads(content)
     except Exception:
         return None
-
     deps = data.get("dependencies", {})
     if not isinstance(deps, dict):
         return None
-
     for mod_id, dep_list in deps.items():
         if not isinstance(dep_list, list):
             continue
@@ -1138,7 +1730,6 @@ def read_mod_info(jar_path):
     try:
         with zipfile.ZipFile(jar_path, "r") as zf:
             namelist = zf.namelist()
-
             if "fabric.mod.json" in namelist:
                 with zf.open("fabric.mod.json") as fm:
                     data = json.load(fm)
@@ -1149,21 +1740,18 @@ def read_mod_info(jar_path):
                         "mc_versions": mc_vers,
                         "loader_version": None,
                     }
-
             if "META-INF/mods.toml" in namelist:
                 with zf.open("META-INF/mods.toml") as fm:
                     content = fm.read().decode("utf-8", errors="replace")
                 info = parse_toml_mod_info(content, "forge")
                 if info:
                     return info
-
             if "META-INF/neoforge.mods.toml" in namelist:
                 with zf.open("META-INF/neoforge.mods.toml") as fm:
                     content = fm.read().decode("utf-8", errors="replace")
                 info = parse_toml_mod_info(content, "neoforge")
                 if info:
                     return info
-
     except Exception:
         pass
     return None
@@ -1173,7 +1761,6 @@ def read_mod_display_name(jar_path):
     try:
         with zipfile.ZipFile(jar_path, "r") as zf:
             namelist = zf.namelist()
-
             if "fabric.mod.json" in namelist:
                 try:
                     with zf.open("fabric.mod.json") as fm:
@@ -1184,7 +1771,6 @@ def read_mod_display_name(jar_path):
                             return str(name).strip() or None
                 except Exception:
                     pass
-
             if "META-INF/mods.toml" in namelist and tomllib is not None:
                 try:
                     with zf.open("META-INF/mods.toml") as fm:
@@ -1194,15 +1780,11 @@ def read_mod_display_name(jar_path):
                     if isinstance(mods, list) and mods:
                         first = mods[0]
                         if isinstance(first, dict):
-                            name = (
-                                first.get("displayName")
-                                or first.get("modId")
-                            )
+                            name = (first.get("displayName") or first.get("modId"))
                             if name:
                                 return str(name).strip() or None
                 except Exception:
                     pass
-
             if "META-INF/neoforge.mods.toml" in namelist and tomllib is not None:
                 try:
                     with zf.open("META-INF/neoforge.mods.toml") as fm:
@@ -1212,10 +1794,7 @@ def read_mod_display_name(jar_path):
                     if isinstance(mods, list) and mods:
                         first = mods[0]
                         if isinstance(first, dict):
-                            name = (
-                                first.get("displayName")
-                                or first.get("modId")
-                            )
+                            name = (first.get("displayName") or first.get("modId"))
                             if name:
                                 return str(name).strip() or None
                 except Exception:
@@ -1229,7 +1808,6 @@ def read_mod_display_name(jar_path):
 #  ИДЕНТИФИКАЦИЯ МОДОВ (modId + loader)
 # ============================================================
 def _extract_toml_mod_ids(data):
-    """Из распарсенного TOML-файла (mods.toml) вытаскивает список modId."""
     if not isinstance(data, dict):
         return []
     mods = data.get("mods")
@@ -1245,15 +1823,9 @@ def _extract_toml_mod_ids(data):
 
 
 def extract_mod_ids(jar_path):
-    """
-    Возвращает (loader, [mod_ids]) из метаданных jar'а или (None, []).
-    loader — 'fabric' | 'forge' | 'neoforge'.
-    mod_ids — список идентификаторов, которые предоставляет jar.
-    """
     try:
         with zipfile.ZipFile(jar_path, "r") as zf:
             namelist = zf.namelist()
-
             if "fabric.mod.json" in namelist:
                 data = None
                 try:
@@ -1268,7 +1840,6 @@ def extract_mod_ids(jar_path):
                         ids.append(mid.strip())
                 if ids:
                     return ("fabric", ids)
-
             if "META-INF/mods.toml" in namelist and tomllib is not None:
                 data = None
                 try:
@@ -1280,7 +1851,6 @@ def extract_mod_ids(jar_path):
                 ids = _extract_toml_mod_ids(data)
                 if ids:
                     return ("forge", ids)
-
             if "META-INF/neoforge.mods.toml" in namelist and tomllib is not None:
                 data = None
                 try:
@@ -1292,7 +1862,6 @@ def extract_mod_ids(jar_path):
                 ids = _extract_toml_mod_ids(data)
                 if ids:
                     return ("neoforge", ids)
-
     except Exception:
         pass
     return (None, [])
@@ -1306,11 +1875,7 @@ def get_manifest_path(instance_dir):
 
 
 def _empty_manifest():
-    return {
-        "version": MANIFEST_VERSION,
-        "mods": {},
-        "by_mod_id": {},
-    }
+    return {"version": MANIFEST_VERSION, "mods": {}, "by_mod_id": {}}
 
 
 def _rebuild_by_mod_id(manifest):
@@ -1318,7 +1883,6 @@ def _rebuild_by_mod_id(manifest):
     mods = manifest.get("mods") or {}
     if not isinstance(mods, dict):
         return by_id
-
     for disabled_pass in (True, False):
         for fn in sorted(mods.keys()):
             entry = mods.get(fn)
@@ -1347,7 +1911,6 @@ def load_mod_manifest(instance_dir):
         return _empty_manifest()
     if not isinstance(data, dict):
         return _empty_manifest()
-
     manifest = _empty_manifest()
     mods = data.get("mods")
     if isinstance(mods, dict):
@@ -1359,7 +1922,6 @@ def load_mod_manifest(instance_dir):
 
 
 def save_mod_manifest(instance_dir, manifest):
-    """Атомарно сохраняет манифест."""
     path = get_manifest_path(instance_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -1383,22 +1945,18 @@ def build_mod_manifest_entry(jar_path, loader_hint=None, extra=None, disabled=Fa
         "modrinth": None,
         "disabled": bool(disabled),
     }
-
     loader, mod_ids = extract_mod_ids(jar_path)
     if loader is None and loader_hint:
         loader = loader_hint
     entry["loader"] = loader
     entry["mod_ids"] = mod_ids
-
     try:
         entry["sha1"] = sha1_file(jar_path)
     except Exception:
         pass
-
     if isinstance(extra, dict):
         for k, v in extra.items():
             entry[k] = v
-
     return entry
 
 
@@ -1417,14 +1975,11 @@ def remove_manifest_entry(manifest, filename):
 
 
 # ============================================================
-#  ПРОВЕРКА СОВМЕСТИМОСТИ ЗАГРУЗЧИКОВ С MC
+#  СОВМЕСТИМОСТЬ ЗАГРУЗЧИКОВ
 # ============================================================
 def fetch_fabric_mc_versions():
-    """MC-версии, поддерживаемые Fabric. None при ошибке."""
     try:
-        r = requests.get(
-            "https://meta.fabricmc.net/v2/versions/game", timeout=7
-        )
+        r = requests.get("https://meta.fabricmc.net/v2/versions/game", timeout=7)
         r.raise_for_status()
         data = r.json()
         result = set()
@@ -1440,7 +1995,6 @@ def fetch_fabric_mc_versions():
 
 
 def fetch_forge_mc_versions():
-    """MC-версии, поддерживаемые Forge. None при ошибке."""
     try:
         r = requests.get(
             "https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml",
@@ -1462,10 +2016,8 @@ def fetch_forge_mc_versions():
 
 
 def fetch_neoforge_mc_versions():
-    """MC-версии, поддерживаемые NeoForge (modern + legacy 1.20.1). None при полной ошибке."""
     result = set()
     any_success = False
-
     try:
         r = requests.get(
             "https://maven.neoforged.net/api/maven/versions/releases/"
@@ -1495,7 +2047,6 @@ def fetch_neoforge_mc_versions():
         any_success = True
     except Exception:
         pass
-
     try:
         r = requests.get(
             "https://maven.neoforged.net/api/maven/versions/releases/"
@@ -1512,13 +2063,11 @@ def fetch_neoforge_mc_versions():
         any_success = True
     except Exception:
         pass
-
     return result if any_success else None
 
 
 class LoaderCompatFetchThread(QThread):
-    """Фоново загружает совместимость загрузчиков с MC-версиями."""
-    finished_signal = pyqtSignal(dict)  # {loader_id: set(mc_versions) | None}
+    finished_signal = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
@@ -1553,7 +2102,6 @@ def modrinth_search(query, loader, mc_version, project_type="mod", limit=20):
     ]
     if project_type == "mod":
         facets.append([f"categories:{loader}"])
-
     params = {
         "query": query,
         "facets": json.dumps(facets),
@@ -1566,9 +2114,7 @@ def modrinth_search(query, loader, mc_version, project_type="mod", limit=20):
 
 
 def modrinth_get_versions(project_id, loader, mc_version, project_type="mod"):
-    params = {
-        "game_versions": json.dumps([mc_version]),
-    }
+    params = {"game_versions": json.dumps([mc_version])}
     if project_type == "mod":
         params["loaders"] = json.dumps([loader])
     s = modrinth_session()
@@ -1598,7 +2144,7 @@ def modrinth_get_version_from_hash(file_hash, algorithm="sha1"):
 
 
 # ============================================================
-#  ПОТОК ЗАПУСКА / УСТАНОВКИ
+#  ПОТОК ЗАПУСКА
 # ============================================================
 class LauncherThread(QThread):
     log_signal = pyqtSignal(str)
@@ -1627,12 +2173,8 @@ class LauncherThread(QThread):
         self.process = None
         self._progress_max = 0
 
-    def _cb_status(self, text):
-        self.status_signal.emit(text)
-
-    def _cb_progress(self, progress):
-        self.progress_signal.emit(progress, self._progress_max)
-
+    def _cb_status(self, text): self.status_signal.emit(text)
+    def _cb_progress(self, progress): self.progress_signal.emit(progress, self._progress_max)
     def _cb_max(self, max_progress):
         self._progress_max = max_progress
         self.progress_signal.emit(0, max_progress)
@@ -1666,7 +2208,6 @@ class LauncherThread(QThread):
                 "для этой версии Minecraft, использую системную Java."
             )
             return None
-
         self.log_signal.emit(
             f"[dotLauncher] Проверка/установка Java runtime: {component}"
         )
@@ -1679,7 +2220,6 @@ class LauncherThread(QThread):
                 f"[Ошибка] Не удалось скачать Java runtime ({component}): {e}"
             )
             return None
-
         try:
             exe = minecraft_launcher_lib.runtime.get_executable_path(
                 component, minecraft_dir
@@ -1689,7 +2229,6 @@ class LauncherThread(QThread):
                 f"[Ошибка] Java runtime установлен, но путь получить не удалось: {e}"
             )
             return None
-
         if exe and os.path.isfile(exe):
             self.log_signal.emit(f"[dotLauncher] Managed Java: {exe}")
             return exe
@@ -1750,7 +2289,6 @@ class LauncherThread(QThread):
         try:
             is_vanilla = (not self.loader_id) or self.loader_id == VANILLA_LOADER_ID
             loader_name = MOD_LOADERS.get(self.loader_id, self.loader_id)
-
             if is_vanilla:
                 self.log_signal.emit(
                     f"[dotLauncher] Запуск ванильного Minecraft {self.version}..."
@@ -1760,36 +2298,28 @@ class LauncherThread(QThread):
                     f"[dotLauncher] Начинаю установку Minecraft {self.version} "
                     f"с {loader_name}..."
                 )
-
             self.installing_signal.emit(True)
             minecraft_dir = os.path.join(self.instance_path, ".minecraft")
             os.makedirs(minecraft_dir, exist_ok=True)
-
             callback = self._make_callback()
-
             self.log_signal.emit("[dotLauncher] Установка ванильного Minecraft...")
             minecraft_launcher_lib.install.install_minecraft_version(
                 self.version, minecraft_dir, callback=callback
             )
-
             if self._stop:
                 self.finished_signal.emit(False, "Отменено пользователем")
                 return
-
             effective_java = self.java_path
             if self.use_managed_java:
                 managed = self._ensure_managed_java(minecraft_dir, callback)
                 if managed:
                     effective_java = managed
-
             self._prepend_java_to_path(effective_java)
-
             if not is_vanilla:
                 self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
                 mod_loader = minecraft_launcher_lib.mod_loader.get_mod_loader(
                     self.loader_id
                 )
-
                 loader_version = self.loader_version
                 if not loader_version:
                     try:
@@ -1798,29 +2328,22 @@ class LauncherThread(QThread):
                         )
                     except Exception:
                         loader_version = None
-
                 if not loader_version:
                     raise Exception(
                         f"Не удалось определить версию {loader_name} "
                         f"для Minecraft {self.version}"
                     )
-
                 self.log_signal.emit(
                     f"[dotLauncher] Версия {loader_name}: {loader_version}"
                 )
-
                 mod_loader.install(
-                    self.version,
-                    minecraft_dir,
+                    self.version, minecraft_dir,
                     loader_version=loader_version,
-                    callback=callback,
-                    java=effective_java,
+                    callback=callback, java=effective_java,
                 )
-
                 if self._stop:
                     self.finished_signal.emit(False, "Отменено пользователем")
                     return
-
                 installed_version = mod_loader.get_installed_version(
                     self.version, loader_version
                 )
@@ -1832,12 +2355,10 @@ class LauncherThread(QThread):
                 self.log_signal.emit(
                     f"[dotLauncher] Ванильная версия для запуска: {installed_version}"
                 )
-
             jvm_args = [
                 f"-Xmx{self.memory_mb}M",
                 f"-Xms{min(self.memory_mb, 1024)}M",
             ]
-
             if self.elyby:
                 injector_path = os.path.join(self.instance_path, "authlib-injector.jar")
                 if not is_valid_zip(injector_path, min_size=AUTHLIB_INJECTOR_MIN_SIZE):
@@ -1852,13 +2373,11 @@ class LauncherThread(QThread):
                         self.log_signal.emit(
                             f"[Ошибка] Не удалось скачать authlib-injector: {e}"
                         )
-
                 if not is_valid_zip(injector_path, min_size=AUTHLIB_INJECTOR_MIN_SIZE):
                     raise Exception(
                         "authlib-injector недоступен, запуск Ely.by невозможен"
                     )
                 jvm_args.append(f"-javaagent:{injector_path}=ely.by")
-
             options = {
                 "username": self.username,
                 "uuid": self.uuid_val,
@@ -1869,23 +2388,18 @@ class LauncherThread(QThread):
                 "launcherVersion": LAUNCHER_VERSION,
                 "gameDirectory": minecraft_dir,
             }
-
             command = minecraft_launcher_lib.command.get_minecraft_command(
                 installed_version, minecraft_dir, options
             )
-
             if self._stop:
                 self.finished_signal.emit(False, "Отменено пользователем")
                 return
-
             self.log_signal.emit("[dotLauncher] Запуск Minecraft...")
             self.log_signal.emit(f"[dotLauncher] Рабочая папка: {minecraft_dir}")
             self.log_signal.emit(
                 f"[dotLauncher] JVM: {effective_java} ({self.memory_mb} MB)"
             )
-
             self.installing_signal.emit(False)
-
             self.process = subprocess.Popen(
                 command,
                 cwd=minecraft_dir,
@@ -1896,13 +2410,11 @@ class LauncherThread(QThread):
                 encoding="utf-8",
                 errors="replace",
             )
-
             for line in iter(self.process.stdout.readline, ""):
                 if self._stop:
                     break
                 if line:
                     self.log_signal.emit(line.rstrip())
-
             self.process.wait()
             rc = self.process.returncode
             if rc == 0:
@@ -1913,7 +2425,6 @@ class LauncherThread(QThread):
                     f"[dotLauncher] Игра завершилась с кодом {rc}."
                 )
                 self.finished_signal.emit(False, f"Игра завершилась с кодом {rc}")
-
         except Exception as e:
             self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
             try:
@@ -2001,11 +2512,11 @@ class ElybyRefreshThread(QThread):
 
 
 # ============================================================
-#  ПОТОК: ИНДЕКСАЦИЯ МОДОВ (манифест)
+#  ПОТОК ИНДЕКСАЦИИ МОДОВ
 # ============================================================
 class ModManifestRebuildThread(QThread):
     log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal(bool, str, str)  # ok, error, instance_id
+    finished_signal = pyqtSignal(bool, str, str)
 
     MAX_MODRINTH_FAILURES = 3
 
@@ -2019,15 +2530,13 @@ class ModManifestRebuildThread(QThread):
         self.fetch_modrinth = fetch_modrinth
         self._stop = False
 
-    def stop(self):
-        self._stop = True
+    def stop(self): self._stop = True
 
     def run(self):
         try:
             manifest = _empty_manifest()
             modrinth_failures = 0
             total_files = 0
-
             for sub, disabled in (("mods", False), ("disabledMods", True)):
                 folder = os.path.join(self.minecraft_dir, sub)
                 if not os.path.isdir(folder):
@@ -2047,14 +2556,11 @@ class ModManifestRebuildThread(QThread):
                     full = os.path.join(folder, fn)
                     if not os.path.isfile(full):
                         continue
-
                     total_files += 1
                     entry = build_mod_manifest_entry(
                         full, loader_hint=self.loader_id, disabled=disabled
                     )
-
-                    if (self.fetch_modrinth
-                            and entry.get("sha1")
+                    if (self.fetch_modrinth and entry.get("sha1")
                             and modrinth_failures < self.MAX_MODRINTH_FAILURES):
                         try:
                             vdata = modrinth_get_version_from_hash(
@@ -2068,25 +2574,19 @@ class ModManifestRebuildThread(QThread):
                             }
                             modrinth_failures = 0
                         except requests.exceptions.HTTPError as e:
-                            status = (
-                                e.response.status_code
-                                if e.response is not None else None
-                            )
+                            status = (e.response.status_code
+                                      if e.response is not None else None)
                             if status != 404:
                                 modrinth_failures += 1
                         except Exception:
                             modrinth_failures += 1
-
                     manifest["mods"][fn] = entry
-
                     mids = ", ".join(entry.get("mod_ids") or []) or "?"
                     self.log_signal.emit(
                         f"[dotLauncher] Индексирован {fn} ({mids})"
                     )
-
             manifest["by_mod_id"] = _rebuild_by_mod_id(manifest)
             save_mod_manifest(self.instance_dir, manifest)
-
             self.log_signal.emit(
                 f"[dotLauncher] Индекс модов сохранён: {total_files} файл(ов)."
             )
@@ -2096,7 +2596,7 @@ class ModManifestRebuildThread(QThread):
 
 
 # ============================================================
-#  ПОТОК ИМПОРТА МОДПАКА (jar / zip)
+#  ПОТОК ИМПОРТА (jar / zip)
 # ============================================================
 class ModpackImportThread(QThread):
     log_signal = pyqtSignal(str)
@@ -2143,7 +2643,6 @@ class ModpackImportThread(QThread):
     def _scan_folder(self, folder, mods_info, extra_dirs):
         for root, dirs, files in os.walk(folder, followlinks=False):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-
             for fn in files:
                 if not fn.lower().endswith(".jar"):
                     continue
@@ -2157,7 +2656,6 @@ class ModpackImportThread(QThread):
                     f"{MOD_LOADERS.get(info['loader'], info['loader'])} "
                     f"Minecraft {', '.join(info['mc_versions'])}"
                 )
-
         for base in (folder, os.path.join(folder, ".minecraft")):
             if not os.path.isdir(base):
                 continue
@@ -2169,7 +2667,6 @@ class ModpackImportThread(QThread):
     def _scan(self):
         mods_info = []
         extra_dirs = {}
-
         for path in self.files:
             if self._cancelled:
                 break
@@ -2203,7 +2700,6 @@ class ModpackImportThread(QThread):
                         )
             elif os.path.isdir(path):
                 self._scan_folder(path, mods_info, extra_dirs)
-
         return mods_info, extra_dirs
 
     def _new_instance_id(self):
@@ -2291,11 +2787,9 @@ class ModpackImportThread(QThread):
                 f"[dotLauncher] Обработка {len(self.files)} элементов..."
             )
             mods_info, extra_dirs = self._scan()
-
             if self._cancelled:
                 self.finished_signal.emit(False, {"error": "Отменено"})
                 return
-
             if not mods_info:
                 self.finished_signal.emit(
                     False, {"error": "Не найдено подходящих модов."}
@@ -2305,7 +2799,6 @@ class ModpackImportThread(QThread):
             loaders = Counter()
             versions_per_loader = {}
             loader_versions = {}
-
             for _, info in mods_info:
                 lid = info["loader"]
                 loaders[lid] += 1
@@ -2329,11 +2822,11 @@ class ModpackImportThread(QThread):
                 for lid in available_loaders:
                     all_versions.update(versions_per_loader[lid])
                 mc_versions = sorted(all_versions)
-
                 self.ask_signal.emit(mc_versions, available_loaders)
                 self._event.wait()
                 self._event.clear()
-                if self._cancelled or not self._chosen_version or not self._chosen_loader or not self._chosen_name:
+                if (self._cancelled or not self._chosen_version
+                        or not self._chosen_loader or not self._chosen_name):
                     self.finished_signal.emit(False, {"error": "Отменено"})
                     return
                 chosen_loader = self._chosen_loader
@@ -2349,11 +2842,11 @@ class ModpackImportThread(QThread):
                     self.ask_signal.emit(mc_versions, [chosen_loader])
                     self._event.wait()
                     self._event.clear()
-                    if self._cancelled or not self._chosen_version or not self._chosen_name:
+                    if (self._cancelled or not self._chosen_version
+                            or not self._chosen_name):
                         self.finished_signal.emit(False, {"error": "Отменено"})
                         return
                     chosen_version = self._chosen_version
-
                 if self._chosen_name is None:
                     self.ask_signal.emit([chosen_version], [chosen_loader])
                     self._event.wait()
@@ -2372,7 +2865,6 @@ class ModpackImportThread(QThread):
                 f"({MOD_LOADERS.get(chosen_loader, chosen_loader)} {chosen_version}) создана."
             )
             self.finished_signal.emit(True, info)
-
         except Exception as e:
             self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
             try:
@@ -2387,24 +2879,14 @@ class ModpackImportThread(QThread):
 
 
 # ============================================================
-#  ПОТОК: ИМПОРТ .mrpack
+#  ПОТОК ИМПОРТА .mrpack
 # ============================================================
 class MrpackImportThread(QThread):
-    """
-    Импорт .mrpack через minecraft-launcher-lib.
-    Последовательно:
-      1. Читает манифест (name, summary, optionalFiles).
-      2. Парсит dependencies (minecraft + fabric-loader/forge/neoforge).
-      3. Спрашивает у пользователя имя и выбор опциональных файлов.
-      4. Вызывает mrpack.install_mrpack — библиотека ставит vanilla MC,
-         загрузчик, скачивает файлы, копирует overrides.
-      5. Возвращает info для регистрации инстанса.
-    """
     log_signal = pyqtSignal(str)
     status_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
-    ask_signal = pyqtSignal(dict)  # {default_name, summary, mc_version, loader_display, optional_files}
-    finished_signal = pyqtSignal(bool, dict, str)  # ok, info, error
+    ask_signal = pyqtSignal(dict)
+    finished_signal = pyqtSignal(bool, dict, str)
 
     def __init__(self, mrpack_path, instances_dir, workspace, existing_ids):
         super().__init__()
@@ -2414,7 +2896,7 @@ class MrpackImportThread(QThread):
         self.existing_ids = set(existing_ids)
         self._event = threading.Event()
         self._chosen_name = None
-        self._chosen_optionals = None  # list[str] | None
+        self._chosen_optionals = None
         self._cancelled = False
         self._progress_max = 0
         self.instance_id = None
@@ -2429,13 +2911,8 @@ class MrpackImportThread(QThread):
         self._cancelled = True
         self._event.set()
 
-    # ---------- callbacks ----------
-    def _cb_status(self, text):
-        self.status_signal.emit(text)
-
-    def _cb_progress(self, progress):
-        self.progress_signal.emit(progress, self._progress_max)
-
+    def _cb_status(self, text): self.status_signal.emit(text)
+    def _cb_progress(self, progress): self.progress_signal.emit(progress, self._progress_max)
     def _cb_max(self, max_progress):
         self._progress_max = max_progress
         self.progress_signal.emit(0, max_progress)
@@ -2447,7 +2924,6 @@ class MrpackImportThread(QThread):
             "setMax": self._cb_max,
         }
 
-    # ---------- helpers ----------
     def _new_instance_id(self):
         while True:
             iid = str(uuid.uuid4())[:8]
@@ -2458,7 +2934,6 @@ class MrpackImportThread(QThread):
             return iid
 
     def _read_index_json(self):
-        """Возвращает распарсенный modrinth.index.json из .mrpack."""
         with zipfile.ZipFile(self.mrpack_path, "r") as zf:
             try:
                 with zf.open("modrinth.index.json") as f:
@@ -2471,10 +2946,6 @@ class MrpackImportThread(QThread):
             return None
 
     def _parse_loader_from_dependencies(self, deps):
-        """
-        Возвращает (loader_id, loader_version, unsupported_label).
-        unsupported_label != None, если загрузчик известен, но не поддерживается.
-        """
         if not isinstance(deps, dict):
             return ("vanilla", None, None)
         for key, lid in MRPACK_LOADER_KEYS.items():
@@ -2495,7 +2966,6 @@ class MrpackImportThread(QThread):
             except Exception:
                 pass
 
-    # ---------- run ----------
     def run(self):
         try:
             if not MRPACK_AVAILABLE:
@@ -2505,26 +2975,21 @@ class MrpackImportThread(QThread):
                     "minecraft-launcher-lib. Обновите библиотеку."
                 )
                 return
-
             if not os.path.isfile(self.mrpack_path):
                 self.finished_signal.emit(
                     False, {}, f"Файл не найден: {self.mrpack_path}"
                 )
                 return
-
             self.log_signal.emit(
                 f"[dotLauncher] Чтение .mrpack: "
                 f"{os.path.basename(self.mrpack_path)}"
             )
-
-            # 1. Прочитать манифест
             index = self._read_index_json()
             if index is None:
                 self.finished_signal.emit(
                     False, {}, "Некорректный .mrpack: нет modrinth.index.json"
                 )
                 return
-
             deps = index.get("dependencies") or {}
             mc_version = deps.get("minecraft")
             if not mc_version or not isinstance(mc_version, str):
@@ -2532,7 +2997,6 @@ class MrpackImportThread(QThread):
                     False, {}, "В манифесте не указана версия Minecraft"
                 )
                 return
-
             loader_id, loader_version, unsupported = (
                 self._parse_loader_from_dependencies(deps)
             )
@@ -2545,7 +3009,6 @@ class MrpackImportThread(QThread):
                 )
                 return
 
-            # Пробуем получить человекочитаемые name/summary/optional
             default_name = index.get("name") or "Imported Modpack"
             summary = index.get("summary") or ""
             optional_files = []
@@ -2572,7 +3035,6 @@ class MrpackImportThread(QThread):
                 f"{loader_version or ''}".rstrip()
             )
 
-            # 2. Спросить у пользователя
             self.ask_signal.emit({
                 "default_name": default_name,
                 "summary": summary,
@@ -2591,7 +3053,6 @@ class MrpackImportThread(QThread):
             name = sanitize_instance_name(self._chosen_name)
             selected_optionals = self._chosen_optionals or []
 
-            # 3. Готовим instance dir
             self.instance_id = self._new_instance_id()
             self.instance_dir = os.path.join(
                 self.instances_dir, self.instance_id
@@ -2601,15 +3062,12 @@ class MrpackImportThread(QThread):
 
             callback = self._make_callback()
 
-            # 4. Строим mrpack_install_options для выбранных опциональных
-            # Параметр ожидает dict: {path_из_манифеста: True|False}
             install_options = {}
             if optional_files:
                 selected_set = set(selected_optionals)
                 for opt in optional_files:
                     install_options[opt] = (opt in selected_set)
 
-            # 5. Устанавливаем через mrpack.install_mrpack
             self.log_signal.emit(
                 "[dotLauncher] Установка модпака (Minecraft + загрузчик + файлы)..."
             )
@@ -2638,7 +3096,6 @@ class MrpackImportThread(QThread):
                 self.finished_signal.emit(False, {}, "Отменено пользователем")
                 return
 
-            # 6. Регистрируем результат
             path_rel = os.path.relpath(self.instance_dir, self.workspace)
             info = {
                 "instance_id": self.instance_id,
@@ -2648,11 +3105,8 @@ class MrpackImportThread(QThread):
                 "loader_version": loader_version,
                 "path_rel": path_rel,
             }
-            self.log_signal.emit(
-                f"[dotLauncher] Модпак «{name}» установлен."
-            )
+            self.log_signal.emit(f"[dotLauncher] Модпак «{name}» установлен.")
             self.finished_signal.emit(True, info, "")
-
         except Exception as e:
             self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
             try:
@@ -2664,25 +3118,14 @@ class MrpackImportThread(QThread):
 
 
 # ============================================================
-#  ПОТОК: ИМПОРТ .dotpack (НОВОЕ)
+#  ПОТОК ИМПОРТА .dotpack
 # ============================================================
 class DotpackImportThread(QThread):
-    """
-    Импорт собственного формата .dotpack.
-
-    Читает манифесты (dotpack.json, instance.json, mods.json),
-    извлекает ВСЁ содержимое архива в .minecraft новой сборки
-    (моды, отключённые моды, config, resourcepacks, shaderpacks,
-    defaultconfigs, kubejs, scripts, saves, screenshots, servers.dat,
-    options.txt), восстанавливает индекс модов в .dotlauncher/mods.json,
-    регистрирует инстанс.
-    """
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
     ask_signal = pyqtSignal(dict)
     finished_signal = pyqtSignal(bool, dict, str)
 
-    # Файлы в корне архива, которые являются манифестами, а не контентом
     SPECIAL_ROOT_FILES = ("dotpack.json", "instance.json", "mods.json")
 
     def __init__(self, dotpack_path, instances_dir, workspace, existing_ids):
@@ -2717,12 +3160,10 @@ class DotpackImportThread(QThread):
 
     @staticmethod
     def _is_safe_member(name):
-        """Защита от Zip Slip: запрещаем абсолютные пути и '..'."""
         if not name:
             return False
         if name.startswith("/") or name.startswith("\\"):
             return False
-        # Windows-диск (C:)
         if len(name) >= 2 and name[1] == ":":
             return False
         parts = re.split(r"[\\/]", name)
@@ -2744,24 +3185,20 @@ class DotpackImportThread(QThread):
                     False, {}, f"Файл не найден: {self.dotpack_path}"
                 )
                 return
-
             self.log_signal.emit(
                 f"[dotLauncher] Чтение .dotpack: "
                 f"{os.path.basename(self.dotpack_path)}"
             )
 
-            # ---------- 1. Читаем манифесты ----------
             try:
                 with zipfile.ZipFile(self.dotpack_path, "r") as zf:
                     names = set(zf.namelist())
-
                     if "dotpack.json" not in names:
                         self.finished_signal.emit(
                             False, {},
                             "Некорректный .dotpack: отсутствует dotpack.json"
                         )
                         return
-
                     try:
                         with zf.open("dotpack.json") as f:
                             dotpack_data = json.loads(
@@ -2772,7 +3209,6 @@ class DotpackImportThread(QThread):
                             False, {}, f"Не удалось прочитать dotpack.json: {e}"
                         )
                         return
-
                     if (not isinstance(dotpack_data, dict)
                             or dotpack_data.get("format") != DOTPACK_FORMAT):
                         self.finished_signal.emit(
@@ -2780,8 +3216,6 @@ class DotpackImportThread(QThread):
                             "Файл не является .dotpack-архивом dotLauncher."
                         )
                         return
-
-                    # instance.json
                     instance_data = {}
                     if "instance.json" in names:
                         try:
@@ -2795,8 +3229,6 @@ class DotpackImportThread(QThread):
                             self.log_signal.emit(
                                 f"[Внимание] instance.json не прочитан: {e}"
                             )
-
-                    # mods.json (манифест)
                     manifest_data = None
                     if "mods.json" in names:
                         try:
@@ -2810,7 +3242,6 @@ class DotpackImportThread(QThread):
                             self.log_signal.emit(
                                 f"[Внимание] mods.json не прочитан: {e}"
                             )
-
                     members = list(zf.infolist())
             except zipfile.BadZipFile as e:
                 self.finished_signal.emit(
@@ -2818,7 +3249,6 @@ class DotpackImportThread(QThread):
                 )
                 return
 
-            # ---------- 2. Данные из instance.json ----------
             mc_version = instance_data.get("version") or ""
             if not mc_version or not isinstance(mc_version, str):
                 self.finished_signal.emit(
@@ -2826,38 +3256,30 @@ class DotpackImportThread(QThread):
                     "В instance.json не указана версия Minecraft."
                 )
                 return
-
             loader_id = instance_data.get("loader") or VANILLA_LOADER_ID
             if not isinstance(loader_id, str) or loader_id not in MOD_LOADERS:
                 loader_id = VANILLA_LOADER_ID
-
             loader_version = instance_data.get("loader_version")
             if not isinstance(loader_version, str) or not loader_version:
                 loader_version = None
-
             default_name = instance_data.get("name") or "Imported Dotpack"
             if not isinstance(default_name, str) or not default_name.strip():
                 default_name = "Imported Dotpack"
 
-            # ---------- 3. Формируем список контента для извлечения ----------
             content_members = []
             jar_mod_count = 0
             for m in members:
                 if m.is_dir():
                     continue
                 name = m.filename
-                # Пропускаем корневые манифесты
                 if name in self.SPECIAL_ROOT_FILES:
                     continue
-                # Защита от Zip Slip
                 if not self._is_safe_member(name):
                     self.log_signal.emit(
                         f"[Внимание] Пропущен небезопасный путь: {name!r}"
                     )
                     continue
                 content_members.append(m)
-
-                # Считаем jar'ы модов (для проверки полноты манифеста)
                 low = name.lower().replace("\\", "/")
                 if low.endswith(".jar") and (
                     low.startswith("mods/") or low.startswith("disabledmods/")
@@ -2870,8 +3292,6 @@ class DotpackImportThread(QThread):
                 if isinstance(m_mods, dict):
                     manifest_count = len(m_mods)
 
-            # Если в манифесте записей не меньше, чем jar'ов — считаем,
-            # что индексировать заново не нужно.
             mods_identified = (
                 manifest_data is not None
                 and manifest_count >= jar_mod_count
@@ -2888,7 +3308,6 @@ class DotpackImportThread(QThread):
                 f"модов в манифесте: {manifest_count}, jar'ов: {jar_mod_count}."
             )
 
-            # ---------- 4. Спрашиваем имя сборки ----------
             self.ask_signal.emit({
                 "default_name": default_name,
                 "mc_version": mc_version,
@@ -2907,7 +3326,6 @@ class DotpackImportThread(QThread):
 
             name = sanitize_instance_name(self._chosen_name)
 
-            # ---------- 5. Готовим папку будущей сборки ----------
             self.instance_id = self._new_instance_id()
             self.instance_dir = os.path.join(
                 self.instances_dir, self.instance_id
@@ -2915,7 +3333,6 @@ class DotpackImportThread(QThread):
             minecraft_dir = os.path.join(self.instance_dir, ".minecraft")
             os.makedirs(minecraft_dir, exist_ok=True)
 
-            # ---------- 6. Извлекаем всё содержимое ----------
             total = len(content_members)
             self.progress_signal.emit(0, total)
             extracted = 0
@@ -2933,7 +3350,6 @@ class DotpackImportThread(QThread):
                                 f"[Внимание] Не удалось извлечь "
                                 f"{m.filename}: {e}"
                             )
-                        # Обновляем прогресс не слишком часто
                         if i % 20 == 0 or i == total - 1:
                             self.progress_signal.emit(i + 1, total)
             except Exception as e:
@@ -2952,7 +3368,6 @@ class DotpackImportThread(QThread):
                 f"[dotLauncher] Извлечено {extracted} из {total} файлов."
             )
 
-            # ---------- 7. Сохраняем индекс модов в .dotlauncher/mods.json ----------
             if manifest_data is not None:
                 manifest_dir = os.path.join(
                     self.instance_dir, MANIFEST_DIR_NAME
@@ -2975,7 +3390,6 @@ class DotpackImportThread(QThread):
                         f"[Внимание] Не удалось сохранить индекс модов: {e}"
                     )
 
-            # ---------- 8. Регистрируем сборку ----------
             path_rel = os.path.relpath(self.instance_dir, self.workspace)
             info = {
                 "instance_id": self.instance_id,
@@ -2986,12 +3400,10 @@ class DotpackImportThread(QThread):
                 "path_rel": path_rel,
                 "modsVerIdentified": bool(mods_identified),
             }
-
             self.log_signal.emit(
                 f"[dotLauncher] Сборка «{name}» импортирована из .dotpack."
             )
             self.finished_signal.emit(True, info, "")
-
         except Exception as e:
             self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
             try:
@@ -3003,13 +3415,9 @@ class DotpackImportThread(QThread):
 
 
 # ============================================================
-#  ПОТОК: ЭКСПОРТ СБОРКИ (.zip / .dotpack)
+#  ПОТОК ЭКСПОРТА
 # ============================================================
 class InstanceExportThread(QThread):
-    """
-    Экспорт сборки в .zip (универсальный) или .dotpack (собственный).
-    Ничего не блокирует, всё делает в фоне.
-    """
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(bool, str)
@@ -3024,19 +3432,15 @@ class InstanceExportThread(QThread):
         self.options = options if isinstance(options, dict) else {}
         self._stop = False
 
-    def stop(self):
-        self._stop = True
+    def stop(self): self._stop = True
 
-    # ---------- сбор файлов ----------
     def _collect_files(self):
-        """Возвращает список (abs_path, arcname)."""
         files = []
         mc_dir = self.minecraft_dir
         fmt = self.options.get("format", DOTPACK_FORMAT)
         fat = self.options.get("fat", True)
         include_mods = self.options.get("include_mods", True) and fat
 
-        # --- Моды (активные) ---
         if include_mods:
             mods_dir = os.path.join(mc_dir, "mods")
             if os.path.isdir(mods_dir):
@@ -3048,8 +3452,6 @@ class InstanceExportThread(QThread):
                                 files.append((p, f"mods/{fn}"))
                 except OSError:
                     pass
-
-            # Выключенные моды — только в .dotpack
             if fmt == DOTPACK_FORMAT:
                 ddir = os.path.join(mc_dir, "disabledMods")
                 if os.path.isdir(ddir):
@@ -3062,7 +3464,6 @@ class InstanceExportThread(QThread):
                     except OSError:
                         pass
 
-        # --- Обычные папки с конфигами ---
         dir_flags = (
             ("config", "include_config"),
             ("resourcepacks", "include_resourcepacks"),
@@ -3083,7 +3484,6 @@ class InstanceExportThread(QThread):
                     rel = os.path.relpath(full, mc_dir).replace(os.sep, "/")
                     files.append((full, rel))
 
-        # --- Миры ---
         if self.options.get("include_saves"):
             src = os.path.join(mc_dir, "saves")
             if os.path.isdir(src):
@@ -3093,7 +3493,6 @@ class InstanceExportThread(QThread):
                         rel = os.path.relpath(full, mc_dir).replace(os.sep, "/")
                         files.append((full, rel))
 
-        # --- Скриншоты ---
         if self.options.get("include_screenshots"):
             src = os.path.join(mc_dir, "screenshots")
             if os.path.isdir(src):
@@ -3105,13 +3504,11 @@ class InstanceExportThread(QThread):
                 except OSError:
                     pass
 
-        # --- servers.dat ---
         if self.options.get("include_servers"):
             p = os.path.join(mc_dir, "servers.dat")
             if os.path.isfile(p):
                 files.append((p, "servers.dat"))
 
-        # --- options.txt ---
         if self.options.get("include_options"):
             p = os.path.join(mc_dir, "options.txt")
             if os.path.isfile(p):
@@ -3119,7 +3516,6 @@ class InstanceExportThread(QThread):
 
         return files
 
-    # ---------- манифесты ----------
     def _build_dotpack_json(self):
         return {
             "format": DOTPACK_FORMAT,
@@ -3179,15 +3575,11 @@ class InstanceExportThread(QThread):
             f"версий загрузчика и настроек) используйте формат .dotpack.\n"
         )
 
-    # ---------- run ----------
     def run(self):
         try:
             fmt = self.options.get("format", DOTPACK_FORMAT)
-
             self.log_signal.emit("[dotLauncher] Сканирование сборки...")
             files = self._collect_files()
-
-            # +1 на манифест в начале архива
             total = len(files) + 1
             self.log_signal.emit(
                 f"[dotLauncher] Найдено {len(files)} файл(ов) для упаковки."
@@ -3201,25 +3593,17 @@ class InstanceExportThread(QThread):
 
             try:
                 with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    # 1. Манифесты
                     if fmt == DOTPACK_FORMAT:
-                        # dotpack.json
                         zf.writestr(
                             "dotpack.json",
-                            json.dumps(
-                                self._build_dotpack_json(),
-                                ensure_ascii=False, indent=2
-                            ),
+                            json.dumps(self._build_dotpack_json(),
+                                       ensure_ascii=False, indent=2),
                         )
-                        # instance.json
                         zf.writestr(
                             "instance.json",
-                            json.dumps(
-                                self._build_instance_json(),
-                                ensure_ascii=False, indent=2
-                            ),
+                            json.dumps(self._build_instance_json(),
+                                       ensure_ascii=False, indent=2),
                         )
-                        # mods.json
                         manifest_path = get_manifest_path(self.instance_dir)
                         if os.path.isfile(manifest_path):
                             try:
@@ -3231,10 +3615,8 @@ class InstanceExportThread(QThread):
                                 )
                                 zf.writestr(
                                     "mods.json",
-                                    json.dumps(
-                                        _empty_manifest(),
-                                        ensure_ascii=False, indent=2
-                                    ),
+                                    json.dumps(_empty_manifest(),
+                                               ensure_ascii=False, indent=2),
                                 )
                         else:
                             self.log_signal.emit(
@@ -3244,25 +3626,19 @@ class InstanceExportThread(QThread):
                             )
                             zf.writestr(
                                 "mods.json",
-                                json.dumps(
-                                    _empty_manifest(),
-                                    ensure_ascii=False, indent=2
-                                ),
+                                json.dumps(_empty_manifest(),
+                                           ensure_ascii=False, indent=2),
                             )
                     else:
-                        # .zip
                         zf.writestr(
                             "manifest.json",
-                            json.dumps(
-                                self._build_zip_manifest(),
-                                ensure_ascii=False, indent=2
-                            ),
+                            json.dumps(self._build_zip_manifest(),
+                                       ensure_ascii=False, indent=2),
                         )
                         zf.writestr("README.txt", self._build_readme())
 
                     self.progress_signal.emit(1, total)
 
-                    # 2. Содержимое
                     for i, (abs_path, arcname) in enumerate(files, start=1):
                         if self._stop:
                             raise Exception("Отменено пользователем")
@@ -3274,7 +3650,6 @@ class InstanceExportThread(QThread):
                             )
                         self.progress_signal.emit(i + 1, total)
 
-                # Атомарная замена
                 if os.path.exists(self.output_path):
                     try:
                         os.remove(self.output_path)
@@ -3305,7 +3680,6 @@ class InstanceExportThread(QThread):
                 self.log_signal.emit(traceback.format_exc())
             except Exception:
                 pass
-            # чистим временный файл, если остался
             try:
                 tmp_path = self.output_path + ".tmp"
                 if os.path.exists(tmp_path):
@@ -3316,7 +3690,7 @@ class InstanceExportThread(QThread):
 
 
 # ============================================================
-#  ПОТОК: ЗАГРУЗКА СПИСКА ВЕРСИЙ MINECRAFT
+#  ПОТОК ЗАГРУЗКИ ВЕРСИЙ MC
 # ============================================================
 class VersionFetchThread(QThread):
     finished_signal = pyqtSignal(bool, list, str)
@@ -3330,7 +3704,7 @@ class VersionFetchThread(QThread):
 
 
 # ============================================================
-#  ПОТОК: СОЗДАНИЕ ЧИСТОЙ СБОРКИ (без модов)
+#  ПОТОК СОЗДАНИЯ ЧИСТОЙ СБОРКИ
 # ============================================================
 class InstanceInstallThread(QThread):
     log_signal = pyqtSignal(str)
@@ -3351,12 +3725,8 @@ class InstanceInstallThread(QThread):
         self._stop = False
         self._progress_max = 0
 
-    def _cb_status(self, text):
-        self.status_signal.emit(text)
-
-    def _cb_progress(self, progress):
-        self.progress_signal.emit(progress, self._progress_max)
-
+    def _cb_status(self, text): self.status_signal.emit(text)
+    def _cb_progress(self, progress): self.progress_signal.emit(progress, self._progress_max)
     def _cb_max(self, max_progress):
         self._progress_max = max_progress
         self.progress_signal.emit(0, max_progress)
@@ -3372,7 +3742,6 @@ class InstanceInstallThread(QThread):
         try:
             is_vanilla = (not self.loader_id) or self.loader_id == VANILLA_LOADER_ID
             loader_name = MOD_LOADERS.get(self.loader_id, self.loader_id)
-
             if is_vanilla:
                 self.log_signal.emit(
                     f"[dotLauncher] Создание ванильной сборки «{self.name}»: "
@@ -3383,52 +3752,41 @@ class InstanceInstallThread(QThread):
                     f"[dotLauncher] Создание сборки «{self.name}»: "
                     f"Minecraft {self.version} + {loader_name}"
                 )
-
             instance_dir = os.path.join(self.instances_dir, self.instance_id)
             minecraft_dir = os.path.join(instance_dir, ".minecraft")
             os.makedirs(minecraft_dir, exist_ok=True)
-
             callback = self._make_callback()
-
             self.log_signal.emit("[dotLauncher] Установка ванильного Minecraft...")
             minecraft_launcher_lib.install.install_minecraft_version(
                 self.version, minecraft_dir, callback=callback
             )
-
             if self._stop:
                 self.finished_signal.emit(
                     False, {"instance_id": self.instance_id},
                     "Отменено пользователем"
                 )
                 return
-
             loader_version = None
-
             if not is_vanilla:
                 self.log_signal.emit(f"[dotLauncher] Установка {loader_name}...")
                 mod_loader = minecraft_launcher_lib.mod_loader.get_mod_loader(
                     self.loader_id
                 )
-
                 try:
                     loader_version = mod_loader.get_latest_loader_version(self.version)
                 except Exception:
                     loader_version = None
-
                 if not loader_version:
                     raise Exception(
                         f"Не удалось определить версию {loader_name} "
                         f"для Minecraft {self.version}"
                     )
-
                 self.log_signal.emit(
                     f"[dotLauncher] Версия {loader_name}: {loader_version}"
                 )
-
                 install_kwargs = {}
                 if self.java_path:
                     install_kwargs["java"] = self.java_path
-
                 mod_loader.install(
                     self.version,
                     minecraft_dir,
@@ -3436,7 +3794,6 @@ class InstanceInstallThread(QThread):
                     callback=callback,
                     **install_kwargs,
                 )
-
                 if self._stop:
                     self.finished_signal.emit(
                         False, {"instance_id": self.instance_id},
@@ -3444,9 +3801,7 @@ class InstanceInstallThread(QThread):
                     )
                     return
             else:
-                self.log_signal.emit(
-                    "[dotLauncher] Ванильная установка завершена."
-                )
+                self.log_signal.emit("[dotLauncher] Ванильная установка завершена.")
 
             path_rel = os.path.relpath(instance_dir, self.workspace)
             info = {
@@ -3457,9 +3812,7 @@ class InstanceInstallThread(QThread):
                 "loader_version": loader_version,
                 "path_rel": path_rel,
             }
-            self.log_signal.emit(
-                f"[dotLauncher] Сборка «{self.name}» создана."
-            )
+            self.log_signal.emit(f"[dotLauncher] Сборка «{self.name}» создана.")
             self.finished_signal.emit(True, info, "")
         except Exception as e:
             self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
@@ -3471,8 +3824,7 @@ class InstanceInstallThread(QThread):
                 False, {"instance_id": self.instance_id}, str(e)
             )
 
-    def stop(self):
-        self._stop = True
+    def stop(self): self._stop = True
 
 
 # ============================================================
@@ -3534,14 +3886,12 @@ class ModrinthDownloadThread(QThread):
         self.project_type = project_type
         self._stop = False
 
-    def stop(self):
-        self._stop = True
+    def stop(self): self._stop = True
 
     def _resolve_project(self, project_id, version_id, to_download, visited):
         if project_id in visited:
             return
         visited.add(project_id)
-
         v = None
         if version_id:
             try:
@@ -3568,15 +3918,11 @@ class ModrinthDownloadThread(QThread):
                 )
                 return
             v = versions[0]
-
         to_download[project_id] = v
-
         if not self.download_deps:
             return
-
         if self.project_type != "mod":
             return
-
         for dep in v.get("dependencies", []):
             if dep.get("dependency_type") != "required":
                 continue
@@ -3588,9 +3934,7 @@ class ModrinthDownloadThread(QThread):
                 except Exception:
                     dep_pid = None
             if dep_pid and dep_pid not in visited:
-                self.log_signal.emit(
-                    f"[Modrinth] Зависимость: {dep_pid}"
-                )
+                self.log_signal.emit(f"[Modrinth] Зависимость: {dep_pid}")
                 self._resolve_project(dep_pid, None, to_download, visited)
 
     def _pick_primary_file(self, vdata):
@@ -3607,22 +3951,18 @@ class ModrinthDownloadThread(QThread):
                 f"[Modrinth] У версии {vdata.get('version_number')} нет файлов"
             )
             return
-
         url = primary.get("url")
         filename = primary.get("filename") or "mod.jar"
         if not url:
             return
-
         dest = os.path.join(self.target_dir, filename)
         if os.path.isfile(dest):
             self.log_signal.emit(f"[Modrinth] Уже установлен: {filename}")
             return
-
         self.log_signal.emit(f"[Modrinth] Скачивание {filename}...")
         s = modrinth_session()
         r = s.get(url, stream=True, timeout=120)
         r.raise_for_status()
-
         tmp = dest + ".tmp"
         try:
             with open(tmp, "wb") as f:
@@ -3641,10 +3981,8 @@ class ModrinthDownloadThread(QThread):
     def run(self):
         try:
             os.makedirs(self.target_dir, exist_ok=True)
-
             to_download = {}
             visited = set()
-
             for proj in self.projects:
                 if self._stop:
                     self.finished_signal.emit(False, "Отменено")
@@ -3653,17 +3991,14 @@ class ModrinthDownloadThread(QThread):
                     proj["project_id"], proj.get("version_id"),
                     to_download, visited
                 )
-
             if not to_download:
                 self.finished_signal.emit(
                     False, "Не найдено подходящих версий для выбранных проектов."
                 )
                 return
-
             total = len(to_download)
             self.log_signal.emit(f"[Modrinth] К загрузке: {total} файл(ов)")
             self.progress_signal.emit(0, total)
-
             for i, (pid, vdata) in enumerate(to_download.items(), start=1):
                 if self._stop:
                     self.finished_signal.emit(False, "Отменено")
@@ -3673,14 +4008,13 @@ class ModrinthDownloadThread(QThread):
                 except Exception as e:
                     self.log_signal.emit(f"[Modrinth] Ошибка загрузки: {e}")
                 self.progress_signal.emit(i, total)
-
             self.finished_signal.emit(True, f"Загрузка завершена: {total} файл(ов).")
         except Exception as e:
             self.finished_signal.emit(False, str(e))
 
 
 # ============================================================
-#  КЛИКАБЕЛЬНЫЙ ФРЕЙМ (для карточек результатов)
+#  КЛИКАБЕЛЬНЫЙ ФРЕЙМ
 # ============================================================
 from PyQt6.QtCore import pyqtSignal as _pyqtSignal  # noqa
 
@@ -3707,23 +4041,17 @@ class ModrinthWindow(QDialog):
         self.instance_dir = instance_dir
         self.minecraft_dir = os.path.join(instance_dir, ".minecraft")
         self.vanilla = bool(vanilla)
-
         self.current_type = "resourcepack" if self.vanilla else "mod"
-
-        # chosen: pid -> {"hit": hit, "version_id": str|None, "version_label": str}
         self.chosen = {}
         self._result_cards = []
         self.search_thread = None
         self.download_thread = None
         self.versions_thread = None
-
         self.active_project_id = None
         self.active_hit = None
         self.active_versions = []
         self.project_version_ids = {}
-
         self.downloaded_mods = False
-
         self.setWindowTitle(f"Modrinth — {instance_name}")
         self.setMinimumSize(960, 720)
         self.init_ui()
@@ -3745,10 +4073,8 @@ class ModrinthWindow(QDialog):
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
-
         self.stack.addWidget(self._build_search_page())
         self.stack.addWidget(self._build_confirm_page())
         self.stack.setCurrentIndex(0)
@@ -3757,12 +4083,11 @@ class ModrinthWindow(QDialog):
         page = QWidget()
         v = QVBoxLayout(page)
         v.setContentsMargins(0, 0, 0, 0)
-
         header_row = QHBoxLayout()
         header_row.setSpacing(4)
-
         header_left = QLabel("Поиск")
         header_left.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        header_left.setProperty("class", "groupHeader")
         header_row.addWidget(header_left)
 
         self.type_combo = QComboBox()
@@ -3782,7 +4107,6 @@ class ModrinthWindow(QDialog):
             )
         self.header_suffix.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         header_row.addWidget(self.header_suffix)
-
         header_row.addStretch()
         v.addLayout(header_row)
 
@@ -3794,7 +4118,6 @@ class ModrinthWindow(QDialog):
             self.search_input.setPlaceholderText("Введите название...")
         self.search_input.returnPressed.connect(self.do_search)
         row.addWidget(self.search_input)
-
         search_btn = QPushButton("Найти")
         search_btn.setFixedWidth(90)
         search_btn.clicked.connect(self.do_search)
@@ -3811,9 +4134,9 @@ class ModrinthWindow(QDialog):
         rc = QVBoxLayout(results_container)
         rc.setContentsMargins(0, 0, 0, 0)
         rc.setSpacing(2)
-
         results_label = QLabel("Результаты")
         results_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        results_label.setProperty("class", "groupHeader")
         rc.addWidget(results_label)
 
         self.results_scroll = QScrollArea()
@@ -3821,22 +4144,21 @@ class ModrinthWindow(QDialog):
         self.results_scroll.setFrameShape(QFrame.Shape.StyledPanel)
         self.results_scroll.setFrameShadow(QFrame.Shadow.Sunken)
         self.results_widget = QWidget()
-        self.results_widget.setStyleSheet("background-color: #ffffff;")
+        self.results_widget.setObjectName("resultsWidget")
         self.results_layout = QVBoxLayout(self.results_widget)
         self.results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.results_layout.setSpacing(4)
         self.results_scroll.setWidget(self.results_widget)
         rc.addWidget(self.results_scroll, 1)
-
         content_splitter.addWidget(results_container)
 
         versions_container = QWidget()
         vc = QVBoxLayout(versions_container)
         vc.setContentsMargins(0, 0, 0, 0)
         vc.setSpacing(2)
-
         versions_label = QLabel("Версии")
         versions_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        versions_label.setProperty("class", "groupHeader")
         vc.addWidget(versions_label)
 
         self.versions_info = QLabel("Кликните на элемент слева, чтобы увидеть версии")
@@ -3850,33 +4172,29 @@ class ModrinthWindow(QDialog):
         self.versions_status = QLabel("")
         self.versions_status.setWordWrap(True)
         vc.addWidget(self.versions_status)
-
         content_splitter.addWidget(versions_container)
         content_splitter.setStretchFactor(0, 3)
         content_splitter.setStretchFactor(1, 2)
-
         v.addWidget(content_splitter, 1)
 
         bottom = QHBoxLayout()
         self.chosen_label = QLabel("Выбрано: 0")
         bottom.addWidget(self.chosen_label)
         bottom.addStretch()
-
         confirm_btn = QPushButton("Подтвердить")
         confirm_btn.setFixedSize(140, 26)
         confirm_btn.clicked.connect(self.go_to_confirm)
         bottom.addWidget(confirm_btn)
         v.addLayout(bottom)
-
         return page
 
     def _build_confirm_page(self):
         page = QWidget()
         v = QVBoxLayout(page)
         v.setContentsMargins(0, 0, 0, 0)
-
         header = QLabel("Подтверждение")
         header.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        header.setProperty("class", "groupHeader")
         v.addWidget(header)
 
         self.confirm_label = QLabel("")
@@ -3911,7 +4229,6 @@ class ModrinthWindow(QDialog):
         back_btn = QPushButton("Назад")
         back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
         v.addWidget(back_btn)
-
         return page
 
     def _types_list(self):
@@ -3924,7 +4241,6 @@ class ModrinthWindow(QDialog):
         if idx < 0 or idx >= len(types):
             return
         self.current_type = types[idx]
-
         if self.current_type == "mod":
             self.header_suffix.setText(
                 f"для {self.loader_name()} {self.mc_version}"
@@ -3939,9 +4255,7 @@ class ModrinthWindow(QDialog):
             self.header_suffix.setText(f"для Minecraft {self.mc_version}")
             self.search_input.setPlaceholderText("Введите название шейдера...")
             self.deps_check.setEnabled(False)
-
         self._reset_versions_panel()
-
         query = self.search_input.text().strip()
         if query and not (self.search_thread and self.search_thread.isRunning()):
             self.do_search()
@@ -3957,11 +4271,9 @@ class ModrinthWindow(QDialog):
             return
         if self.search_thread and self.search_thread.isRunning():
             return
-
         self.search_status.setText("Поиск...")
         self._clear_results()
         self._reset_versions_panel()
-
         self.search_thread = ModrinthSearchThread(
             query, self.modrinth_loader(), self.mc_version, self.current_type
         )
@@ -4005,17 +4317,13 @@ class ModrinthWindow(QDialog):
         self.active_hit = hit
         self.active_versions = []
         self.versions_list.clear()
-        self.versions_info.setText(
-            f"Версии для: {hit.get('title', pid)}"
-        )
+        self.versions_info.setText(f"Версии для: {hit.get('title', pid)}")
         self.versions_status.setText("Загрузка версий...")
-
         if self.versions_thread and self.versions_thread.isRunning():
             try:
                 self.versions_thread.finished_signal.disconnect()
             except Exception:
                 pass
-
         self.versions_thread = ModrinthVersionsThread(
             pid, self.modrinth_loader(), self.mc_version, self.current_type
         )
@@ -4029,11 +4337,8 @@ class ModrinthWindow(QDialog):
             self.versions_status.setText(f"Ошибка загрузки версий: {error}")
             return
         if not versions:
-            self.versions_status.setText(
-                "Нет версий для этой конфигурации"
-            )
+            self.versions_status.setText("Нет версий для этой конфигурации")
             return
-
         self.active_versions = versions
         self.versions_status.setText(f"Найдено версий: {len(versions)}")
         self.versions_list.clear()
@@ -4042,7 +4347,6 @@ class ModrinthWindow(QDialog):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, vdata)
             self.versions_list.addItem(item)
-
         if self.versions_list.count() > 0:
             self.versions_list.setCurrentRow(0)
 
@@ -4062,33 +4366,25 @@ class ModrinthWindow(QDialog):
         pid = hit.get("project_id") or hit.get("slug")
         if not pid:
             return
-
         card = ClickableFrame()
-        card.setFrameShape(QFrame.Shape.StyledPanel)
-        card.setFrameShadow(QFrame.Shadow.Raised)
-        card.setStyleSheet("QFrame { background-color: #c0c0c0; }")
+        card.setProperty("role", "card")
         card.setMinimumHeight(80)
         card.setCursor(Qt.CursorShape.PointingHandCursor)
 
         h = QHBoxLayout(card)
         h.setContentsMargins(8, 6, 8, 6)
-
         info = QVBoxLayout()
         title = QLabel(hit.get("title", "Unknown"))
         title.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         info.addWidget(title)
-
         author = QLabel(f"by {hit.get('author', 'Unknown')}")
         info.addWidget(author)
-
         desc = QLabel((hit.get("description") or "")[:220])
         desc.setWordWrap(True)
         info.addWidget(desc)
-
         downloads = hit.get("downloads", 0) or 0
         meta = QLabel(f"Загрузок: {downloads:,}")
         info.addWidget(meta)
-
         h.addLayout(info, 1)
 
         btn = QPushButton("Скачать")
@@ -4096,7 +4392,9 @@ class ModrinthWindow(QDialog):
         if pid in self.chosen:
             btn.setText("Добавлено ✓")
 
-        card.clicked.connect(lambda _pid=pid, _hit=hit: self._on_card_clicked(_pid, _hit))
+        card.clicked.connect(
+            lambda _pid=pid, _hit=hit: self._on_card_clicked(_pid, _hit)
+        )
 
         def on_click(_checked=False, _pid=pid, _hit=hit, _btn=btn):
             if _pid in self.chosen:
@@ -4104,11 +4402,11 @@ class ModrinthWindow(QDialog):
                 _btn.setText("Скачать")
             else:
                 vid = self.project_version_ids.get(_pid)
-                if vid is None and _pid == self.active_project_id and self.active_versions:
+                if (vid is None and _pid == self.active_project_id
+                        and self.active_versions):
                     vid = self.active_versions[0].get("id")
                     if vid:
                         self.project_version_ids[_pid] = vid
-
                 label = "(последняя версия)"
                 if vid:
                     for vdata in self.active_versions:
@@ -4117,7 +4415,6 @@ class ModrinthWindow(QDialog):
                             break
                     else:
                         label = f"ID: {vid[:8]}…"
-
                 self.chosen[_pid] = {
                     "hit": _hit,
                     "version_id": vid,
@@ -4128,7 +4425,6 @@ class ModrinthWindow(QDialog):
 
         btn.clicked.connect(on_click)
         h.addWidget(btn, alignment=Qt.AlignmentFlag.AlignVCenter)
-
         self.results_layout.addWidget(card)
         self._result_cards.append(card)
 
@@ -4139,7 +4435,6 @@ class ModrinthWindow(QDialog):
         if not self.chosen:
             QMessageBox.information(self, "Пусто", "Выберите хотя бы один проект.")
             return
-
         self.confirm_list.clear()
         for pid, entry in self.chosen.items():
             hit = entry.get("hit", {})
@@ -4152,13 +4447,11 @@ class ModrinthWindow(QDialog):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, pid)
             self.confirm_list.addItem(item)
-
         type_label = {
             "mod": "модов",
             "resourcepack": "ресурспаков",
             "shader": "шейдеров",
         }.get(self.current_type, "проектов")
-
         self.confirm_label.setText(
             f"Будет установлено в сборку «{self.instance_name}»: "
             f"{len(self.chosen)} {type_label}."
@@ -4168,7 +4461,6 @@ class ModrinthWindow(QDialog):
     def do_download(self):
         if self.download_thread and self.download_thread.isRunning():
             return
-
         projects = []
         for pid, entry in self.chosen.items():
             hit = entry.get("hit", {})
@@ -4180,18 +4472,15 @@ class ModrinthWindow(QDialog):
         if not projects:
             QMessageBox.information(self, "Пусто", "Список пуст.")
             return
-
         download_deps = (
             self.deps_check.isChecked() and self.current_type == "mod"
         )
-
         self.download_btn.setEnabled(False)
         self.download_btn.setText("Скачивание...")
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.log_area.setVisible(True)
         self.log_area.clear()
-
         self.download_thread = ModrinthDownloadThread(
             projects,
             self._target_dir(),
@@ -4283,8 +4572,7 @@ class ModVersionReplaceThread(QThread):
         self.download_deps = download_deps
         self._stop = False
 
-    def stop(self):
-        self._stop = True
+    def stop(self): self._stop = True
 
     def _pick_primary_file(self, vdata):
         files = vdata.get("files", []) or []
@@ -4301,17 +4589,14 @@ class ModVersionReplaceThread(QThread):
         filename = primary.get("filename") or "mod.jar"
         if not url:
             raise Exception("У файла нет URL")
-
         dest = dest_override or os.path.join(self.target_dir, filename)
         if dest_override is None and os.path.isfile(dest):
             self.log_signal.emit(f"Уже установлено: {filename}")
             return dest
-
         self.log_signal.emit(f"Скачивание {filename}...")
         s = modrinth_session()
         r = s.get(url, stream=True, timeout=120)
         r.raise_for_status()
-
         tmp = dest + ".tmp"
         try:
             with open(tmp, "wb") as f:
@@ -4343,7 +4628,6 @@ class ModVersionReplaceThread(QThread):
             if not dep_pid or dep_pid in visited:
                 continue
             visited.add(dep_pid)
-
             dep_vdata = None
             if dep_vid:
                 try:
@@ -4359,7 +4643,6 @@ class ModVersionReplaceThread(QThread):
                     versions = []
                 if versions:
                     dep_vdata = versions[0]
-
             if dep_vdata:
                 to_download[dep_pid] = dep_vdata
                 self._collect_deps(dep_vdata, to_download, visited)
@@ -4370,16 +4653,14 @@ class ModVersionReplaceThread(QThread):
             if not primary:
                 self.finished_signal.emit(False, "У выбранной версии нет файлов")
                 return
-
             new_filename = primary.get("filename") or "mod.jar"
             target_path = os.path.join(self.target_dir, new_filename)
-
             old_abs = os.path.realpath(self.old_mod_path)
             new_abs = os.path.realpath(target_path)
             same_file = (old_abs == new_abs)
-
             tmp_main = os.path.join(
-                self.target_dir, f".dotlauncher_replace_{uuid.uuid4().hex[:8]}.tmp"
+                self.target_dir,
+                f".dotlauncher_replace_{uuid.uuid4().hex[:8]}.tmp"
             )
             self.log_signal.emit(f"Скачивание {new_filename}...")
             s = modrinth_session()
@@ -4425,11 +4706,11 @@ class ModVersionReplaceThread(QThread):
             os.replace(tmp_main, target_path)
             self.log_signal.emit(f"Установлен: {new_filename}")
 
-            msg = f"Мод обновлён до версии: {self.version_data.get('version_number', '?')}"
+            msg = (f"Мод обновлён до версии: "
+                   f"{self.version_data.get('version_number', '?')}")
             if deps_downloaded:
                 msg += f" (+{deps_downloaded} зависимостей)"
             self.finished_signal.emit(True, msg)
-
         except Exception as e:
             try:
                 if os.path.exists(tmp_main):
@@ -4440,7 +4721,7 @@ class ModVersionReplaceThread(QThread):
 
 
 # ============================================================
-#  ОКНО: ИЗМЕНЕНИЕ ВЕРСИИ МОДА
+#  ОКНО ИЗМЕНЕНИЯ ВЕРСИИ МОДА
 # ============================================================
 class ModVersionChangeDialog(QDialog):
     def __init__(self, instance_dir, mod_path, loader_id, mc_version,
@@ -4452,19 +4733,17 @@ class ModVersionChangeDialog(QDialog):
         self.loader_id = loader_id
         self.mc_version = mc_version
         self.mod_filename = os.path.basename(mod_path)
-        self.manifest_entry = manifest_entry if isinstance(manifest_entry, dict) else None
-
+        self.manifest_entry = (manifest_entry
+                               if isinstance(manifest_entry, dict) else None)
         self.project_id = None
         self.project_title = ""
         self.current_version_id = None
         self.current_version_number = ""
         self.versions = []
         self.selected_version = None
-
         self.lookup_thread = None
         self.versions_thread = None
         self.replace_thread = None
-
         self.setWindowTitle(f"Изменить версию — {self.mod_filename}")
         self.setMinimumSize(620, 600)
         self.init_ui()
@@ -4480,15 +4759,12 @@ class ModVersionChangeDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-
         header_row = QHBoxLayout()
         header_left = QLabel("Изменение версии мода")
         header_left.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        header_left.setProperty("class", "groupHeader")
         header_row.addWidget(header_left)
-
-        self.header_suffix = QLabel(
-            f"для {self.loader_name()} {self.mc_version}"
-        )
+        self.header_suffix = QLabel(f"для {self.loader_name()} {self.mc_version}")
         self.header_suffix.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
         header_row.addWidget(self.header_suffix)
         header_row.addStretch()
@@ -4504,6 +4780,7 @@ class ModVersionChangeDialog(QDialog):
 
         versions_label = QLabel("Доступные версии")
         versions_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        versions_label.setProperty("class", "groupHeader")
         layout.addWidget(versions_label)
 
         self.versions_list = QListWidget()
@@ -4530,18 +4807,15 @@ class ModVersionChangeDialog(QDialog):
 
         btns = QHBoxLayout()
         btns.addStretch()
-
         self.cancel_btn = QPushButton("Отмена")
         self.cancel_btn.setFixedHeight(26)
         self.cancel_btn.clicked.connect(self.reject)
         btns.addWidget(self.cancel_btn)
-
         self.apply_btn = QPushButton("Применить")
         self.apply_btn.setFixedHeight(26)
         self.apply_btn.setEnabled(False)
         self.apply_btn.clicked.connect(self.on_apply)
         btns.addWidget(self.apply_btn)
-
         layout.addLayout(btns)
 
     def _start_lookup(self):
@@ -4549,13 +4823,9 @@ class ModVersionChangeDialog(QDialog):
             mr = self.manifest_entry.get("modrinth")
             if isinstance(mr, dict) and mr.get("project_id"):
                 self.project_id = mr["project_id"]
-                self.project_title = (
-                    mr.get("project_title") or self.mod_filename
-                )
+                self.project_title = mr.get("project_title") or self.mod_filename
                 self.current_version_id = mr.get("version_id")
-                self.current_version_number = (
-                    mr.get("version_number") or "?"
-                )
+                self.current_version_number = mr.get("version_number") or "?"
                 self.mod_info.setText(
                     f"Мод: {self.project_title}\n"
                     f"Текущая версия: {self.current_version_number}"
@@ -4565,13 +4835,11 @@ class ModVersionChangeDialog(QDialog):
                 )
                 self._load_versions()
                 return
-
         try:
             file_hash = sha1_file(self.mod_path)
         except Exception as e:
             self.lookup_status.setText(f"Не удалось прочитать файл: {e}")
             return
-
         self.lookup_status.setText("Поиск мода на Modrinth по хэшу файла...")
         self.lookup_thread = ModVersionLookupThread(file_hash)
         self.lookup_thread.finished_signal.connect(self._on_lookup_done)
@@ -4595,31 +4863,24 @@ class ModVersionChangeDialog(QDialog):
         if not success:
             self.lookup_status.setText(f"Ошибка: {error}")
             return
-
         self.project_id = data.get("project_id")
         self.project_title = data.get("name") or self.mod_filename
         self.current_version_id = data.get("id")
         self.current_version_number = data.get("version_number", "?")
-
         self.mod_info.setText(
             f"Мод: {self.project_title}\n"
             f"Текущая версия: {self.current_version_number}"
         )
         self.lookup_status.setText("Загрузка списка версий...")
-
         if not self.project_id:
-            self.lookup_status.setText(
-                "Не удалось определить проект на Modrinth."
-            )
+            self.lookup_status.setText("Не удалось определить проект на Modrinth.")
             return
-
         self._update_manifest_with_project_info(
             project_id=self.project_id,
             version_id=self.current_version_id,
             version_number=self.current_version_number,
             project_title=self.project_title,
         )
-
         self._load_versions()
 
     def _on_versions_loaded(self, success, versions, error, project_id):
@@ -4633,7 +4894,6 @@ class ModVersionChangeDialog(QDialog):
                 "Нет версий для этой конфигурации сборки."
             )
             return
-
         self.versions = versions
         self.lookup_status.setText(
             f"Найдено версий: {len(versions)}. Выберите нужную и нажмите «Применить»."
@@ -4646,7 +4906,6 @@ class ModVersionChangeDialog(QDialog):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, vdata)
             self.versions_list.addItem(item)
-
         if self.versions_list.count() > 0:
             self.versions_list.setCurrentRow(0)
 
@@ -4693,14 +4952,11 @@ class ModVersionChangeDialog(QDialog):
             manifest = load_mod_manifest(self.instance_dir)
         except Exception:
             return
-
         remove_manifest_entry(manifest, self.mod_filename)
-
         primary = self._pick_primary_file(self.selected_version)
         new_filename = None
         if primary:
             new_filename = primary.get("filename")
-
         if new_filename:
             new_path = os.path.join(self.minecraft_dir, "mods", new_filename)
             if os.path.isfile(new_path):
@@ -4714,7 +4970,6 @@ class ModVersionChangeDialog(QDialog):
                     "project_title": self.project_title,
                 }
                 merge_manifest_entry(manifest, new_filename, entry)
-
         try:
             save_mod_manifest(self.instance_dir, manifest)
         except Exception:
@@ -4734,17 +4989,14 @@ class ModVersionChangeDialog(QDialog):
             return
         if self.replace_thread and self.replace_thread.isRunning():
             return
-
         target_dir = os.path.join(self.minecraft_dir, "mods")
         os.makedirs(target_dir, exist_ok=True)
-
         self.apply_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self.log_area.setVisible(True)
         self.log_area.clear()
-
         self.replace_thread = ModVersionReplaceThread(
             self.mod_path,
             self.selected_version,
@@ -4796,13 +5048,9 @@ class ModVersionChangeDialog(QDialog):
 
 
 # ============================================================
-#  ОКНО: НАСТРОЙКИ JAVA ДЛЯ ИНСТАНСА
+#  ОКНО НАСТРОЙКИ JAVA
 # ============================================================
 class InstanceJavaDialog(QDialog):
-    """
-    Диалог настройки Java для конкретной сборки.
-    Три варианта: по умолчанию / своя / скачивать автоматически.
-    """
     def __init__(self, instance_name, inst, minecraft_dir,
                  global_java_path, parent=None):
         super().__init__(parent)
@@ -4810,7 +5058,6 @@ class InstanceJavaDialog(QDialog):
         self.inst = inst if isinstance(inst, dict) else {}
         self.minecraft_dir = minecraft_dir
         self.global_java_path = global_java_path
-
         self.result_data = None
         self.setWindowTitle(f"Java для сборки «{instance_name}»")
         self.setMinimumSize(560, 380)
@@ -4820,12 +5067,10 @@ class InstanceJavaDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
-
         mc_version = self.inst.get("version", "?")
         required_major = get_required_java_major(
             self.minecraft_dir, self.inst.get("version")
         )
-
         info = QLabel()
         if required_major:
             info.setText(
@@ -4839,6 +5084,7 @@ class InstanceJavaDialog(QDialog):
             )
         info.setWordWrap(True)
         info.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        info.setProperty("class", "groupHeader")
         layout.addWidget(info)
 
         line = QFrame()
@@ -4846,71 +5092,55 @@ class InstanceJavaDialog(QDialog):
         line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
 
-        # 1. По умолчанию
         self.rb_default = QRadioButton("Использовать Java по умолчанию")
         layout.addWidget(self.rb_default)
-
         self.default_desc = QLabel(f"    {self._describe_default_java()}")
-        self.default_desc.setStyleSheet("color: #404040;")
+        self.default_desc.setProperty("role", "hint")
         self.default_desc.setWordWrap(True)
         layout.addWidget(self.default_desc)
-
         layout.addSpacing(4)
 
-        # 2. Своя Java
         self.rb_custom = QRadioButton("Указать свою Java")
         layout.addWidget(self.rb_custom)
-
         custom_row = QHBoxLayout()
         custom_row.setContentsMargins(20, 0, 0, 0)
         custom_row.setSpacing(4)
-
         self.custom_path_edit = QLineEdit()
         self.custom_path_edit.setPlaceholderText(
             "Путь к java.exe (Windows) или java (Linux/macOS)"
         )
         custom_row.addWidget(self.custom_path_edit, 1)
-
         self.browse_btn = QPushButton("Выбрать...")
         self.browse_btn.clicked.connect(self._browse_java)
         custom_row.addWidget(self.browse_btn)
         layout.addLayout(custom_row)
-
         layout.addSpacing(4)
 
-        # 3. Managed Java
         self.rb_managed = QRadioButton("Скачивать Java автоматически")
         layout.addWidget(self.rb_managed)
-
         managed_desc = QLabel(
             "    Лаунчер скачает нужную версию JVM при первом запуске."
         )
-        managed_desc.setStyleSheet("color: #404040;")
+        managed_desc.setProperty("role", "hint")
         managed_desc.setWordWrap(True)
         layout.addWidget(managed_desc)
-
         layout.addStretch()
 
-        # Кнопки
         btns = QHBoxLayout()
         btns.addStretch()
-
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setFixedHeight(26)
         cancel_btn.clicked.connect(self.reject)
         btns.addWidget(cancel_btn)
-
         ok_btn = QPushButton("OK")
         ok_btn.setFixedHeight(26)
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.on_ok)
         btns.addWidget(ok_btn)
-
         layout.addLayout(btns)
 
         self._set_initial_state()
         self._update_enabled_states()
-
         self.rb_default.toggled.connect(self._update_enabled_states)
         self.rb_custom.toggled.connect(self._update_enabled_states)
         self.rb_managed.toggled.connect(self._update_enabled_states)
@@ -4948,33 +5178,22 @@ class InstanceJavaDialog(QDialog):
 
     def on_ok(self):
         if self.rb_default.isChecked():
-            self.result_data = {
-                "java_path": None,
-                "use_managed_java": False,
-            }
+            self.result_data = {"java_path": None, "use_managed_java": False}
         elif self.rb_custom.isChecked():
             path = self.custom_path_edit.text().strip()
             if not path:
                 QMessageBox.warning(
-                    self, "Ошибка",
-                    "Укажите путь к исполняемому файлу Java."
+                    self, "Ошибка", "Укажите путь к исполняемому файлу Java."
                 )
                 return
             if not os.path.isfile(path):
                 QMessageBox.warning(
-                    self, "Файл не найден",
-                    f"Файл не найден:\n{path}"
+                    self, "Файл не найден", f"Файл не найден:\n{path}"
                 )
                 return
-            self.result_data = {
-                "java_path": path,
-                "use_managed_java": False,
-            }
+            self.result_data = {"java_path": path, "use_managed_java": False}
         elif self.rb_managed.isChecked():
-            self.result_data = {
-                "java_path": None,
-                "use_managed_java": True,
-            }
+            self.result_data = {"java_path": None, "use_managed_java": True}
         else:
             QMessageBox.warning(self, "Ошибка", "Выберите вариант.")
             return
@@ -4982,19 +5201,13 @@ class InstanceJavaDialog(QDialog):
 
 
 # ============================================================
-#  ОКНО: ПОДТВЕРЖДЕНИЕ ИМПОРТА .mrpack
+#  ОКНО ПОДТВЕРЖДЕНИЯ .mrpack
 # ============================================================
 class MrpackConfirmDialog(QDialog):
-    """
-    Диалог подтверждения импорта .mrpack.
-    Показывает информацию о модпаке, поле имени сборки и выбор
-    опциональных файлов.
-    """
     def __init__(self, info, parent=None):
         super().__init__(parent)
         self.info = info if isinstance(info, dict) else {}
-        self.result_data = None  # {"name": str, "optionals": [str, ...]}
-
+        self.result_data = None
         self.setWindowTitle("Импорт модпака (.mrpack)")
         self.setMinimumSize(560, 480)
         self.init_ui()
@@ -5003,9 +5216,9 @@ class MrpackConfirmDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
-
         header = QLabel("Установка модпака Modrinth")
         header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        header.setProperty("class", "groupHeader")
         layout.addWidget(header)
 
         summary = self.info.get("summary") or ""
@@ -5022,7 +5235,7 @@ class MrpackConfirmDialog(QDialog):
         if lv:
             info_text += f" {lv}"
         version_label = QLabel(info_text)
-        version_label.setStyleSheet("color: #404040;")
+        version_label.setProperty("role", "hint")
         layout.addWidget(version_label)
 
         separator = QFrame()
@@ -5030,7 +5243,6 @@ class MrpackConfirmDialog(QDialog):
         separator.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(separator)
 
-        # Имя сборки
         layout.addWidget(QLabel("Название сборки:"))
         self.name_input = QLineEdit()
         default_name = self.info.get("default_name") or "Imported Modpack"
@@ -5038,7 +5250,6 @@ class MrpackConfirmDialog(QDialog):
         self.name_input.selectAll()
         layout.addWidget(self.name_input)
 
-        # Опциональные файлы
         optional_files = self.info.get("optional_files") or []
         layout.addWidget(QLabel(f"Опциональные файлы ({len(optional_files)}):"))
 
@@ -5048,7 +5259,7 @@ class MrpackConfirmDialog(QDialog):
         self.optionals_scroll.setFrameShadow(QFrame.Shadow.Sunken)
 
         self.optionals_widget = QWidget()
-        self.optionals_widget.setStyleSheet("background-color: #ffffff;")
+        self.optionals_widget.setObjectName("optionalsWidget")
         self.optionals_layout = QVBoxLayout(self.optionals_widget)
         self.optionals_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -5061,59 +5272,45 @@ class MrpackConfirmDialog(QDialog):
                 self.optionals_layout.addWidget(cb)
         else:
             placeholder = QLabel("— нет опциональных файлов —")
-            placeholder.setStyleSheet("color: #808080;")
+            placeholder.setProperty("role", "muted")
             self.optionals_layout.addWidget(placeholder)
 
         self.optionals_scroll.setWidget(self.optionals_widget)
         layout.addWidget(self.optionals_scroll, 1)
 
-        # Кнопки
         btns = QHBoxLayout()
         btns.addStretch()
-
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setFixedHeight(26)
         cancel_btn.clicked.connect(self.reject)
         btns.addWidget(cancel_btn)
-
         ok_btn = QPushButton("Установить")
         ok_btn.setFixedHeight(26)
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.on_ok)
         btns.addWidget(ok_btn)
-
         layout.addLayout(btns)
 
     def on_ok(self):
         name = self.name_input.text().strip()
         if not name:
-            QMessageBox.warning(
-                self, "Ошибка", "Введите название сборки."
-            )
+            QMessageBox.warning(self, "Ошибка", "Введите название сборки.")
             return
         selected = [
             path for path, cb in self.optional_checkboxes if cb.isChecked()
         ]
-        self.result_data = {
-            "name": name,
-            "optionals": selected,
-        }
+        self.result_data = {"name": name, "optionals": selected}
         self.accept()
 
 
 # ============================================================
-#  ОКНО: ПОДТВЕРЖДЕНИЕ ИМПОРТА .dotpack (НОВОЕ)
+#  ОКНО ПОДТВЕРЖДЕНИЯ .dotpack
 # ============================================================
 class DotpackConfirmDialog(QDialog):
-    """
-    Диалог подтверждения импорта .dotpack.
-    Показывает информацию о паке и поле ввода имени сборки.
-    """
     def __init__(self, info, parent=None):
         super().__init__(parent)
         self.info = info if isinstance(info, dict) else {}
         self.result_data = None
-
         self.setWindowTitle("Импорт сборки (.dotpack)")
         self.setMinimumSize(540, 380)
         self.init_ui()
@@ -5122,9 +5319,9 @@ class DotpackConfirmDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
-
         header = QLabel("Импорт .dotpack")
         header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        header.setProperty("class", "groupHeader")
         layout.addWidget(header)
 
         info_text = (
@@ -5135,7 +5332,7 @@ class DotpackConfirmDialog(QDialog):
         if lv:
             info_text += f" {lv}"
         version_label = QLabel(info_text)
-        version_label.setStyleSheet("color: #404040;")
+        version_label.setProperty("role", "hint")
         layout.addWidget(version_label)
 
         files_count = self.info.get("files_count", 0)
@@ -5172,23 +5369,19 @@ class DotpackConfirmDialog(QDialog):
         self.name_input.setText(default_name)
         self.name_input.selectAll()
         layout.addWidget(self.name_input)
-
         layout.addStretch()
 
         btns = QHBoxLayout()
         btns.addStretch()
-
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setFixedHeight(26)
         cancel_btn.clicked.connect(self.reject)
         btns.addWidget(cancel_btn)
-
         ok_btn = QPushButton("Импортировать")
         ok_btn.setFixedHeight(26)
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.on_ok)
         btns.addWidget(ok_btn)
-
         layout.addLayout(btns)
 
     def on_ok(self):
@@ -5201,19 +5394,14 @@ class DotpackConfirmDialog(QDialog):
 
 
 # ============================================================
-#  ОКНО: ЭКСПОРТ СБОРКИ
+#  ОКНО ЭКСПОРТА
 # ============================================================
 class ExportInstanceDialog(QDialog):
-    """
-    Диалог экспорта сборки. Формат .zip (универсальный) или .dotpack
-    (собственный формат dotLauncher).
-    """
     def __init__(self, inst, has_mods_manifest, parent=None):
         super().__init__(parent)
         self.inst = inst if isinstance(inst, dict) else {}
         self.has_mods_manifest = bool(has_mods_manifest)
         self.result_data = None
-
         self.setWindowTitle(f"Экспорт сборки «{self.inst.get('name', '')}»")
         self.setMinimumSize(600, 620)
         self.init_ui()
@@ -5222,9 +5410,9 @@ class ExportInstanceDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(6)
-
         header = QLabel("Экспорт сборки")
         header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        header.setProperty("class", "groupHeader")
         layout.addWidget(header)
 
         name_label = QLabel(f"Сборка: {self.inst.get('name', '?')}")
@@ -5239,7 +5427,7 @@ class ExportInstanceDialog(QDialog):
         if lv:
             info_text += f" {lv}"
         version_label = QLabel(info_text)
-        version_label.setStyleSheet("color: #404040;")
+        version_label.setProperty("role", "hint")
         layout.addWidget(version_label)
 
         line = QFrame()
@@ -5247,7 +5435,6 @@ class ExportInstanceDialog(QDialog):
         line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
 
-        # Формат
         layout.addWidget(QLabel("Формат экспорта:"))
         self.rb_dotpack = QRadioButton(
             ".dotpack — собственный формат dotLauncher"
@@ -5260,16 +5447,13 @@ class ExportInstanceDialog(QDialog):
         self.rb_dotpack.setChecked(True)
         layout.addWidget(self.rb_dotpack)
 
-        self.rb_zip = QRadioButton(
-            ".zip — универсальный архив"
-        )
+        self.rb_zip = QRadioButton(".zip — универсальный архив")
         self.rb_zip.setToolTip(
             "Открывается любым лаунчером и человеком вручную.\n"
             "При импорте в dotLauncher моды будут переиндексированы."
         )
         layout.addWidget(self.rb_zip)
 
-        # Состояние манифеста
         if not self.has_mods_manifest:
             warn = QLabel(
                 "⚠  Моды ещё не проиндексированы. При экспорте в .dotpack "
@@ -5277,7 +5461,7 @@ class ExportInstanceDialog(QDialog):
                 "при импорте."
             )
             warn.setWordWrap(True)
-            warn.setStyleSheet("color: #800000;")
+            warn.setProperty("role", "warning")
             layout.addWidget(warn)
 
         line2 = QFrame()
@@ -5285,7 +5469,6 @@ class ExportInstanceDialog(QDialog):
         line2.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line2)
 
-        # Что включить
         layout.addWidget(QLabel("Что включить в архив:"))
 
         self.cb_mods = QCheckBox("Моды (mods/)")
@@ -5315,38 +5498,27 @@ class ExportInstanceDialog(QDialog):
 
         layout.addStretch()
 
-        # Кнопки
         btns = QHBoxLayout()
         btns.addStretch()
-
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setFixedHeight(26)
         cancel_btn.clicked.connect(self.reject)
         btns.addWidget(cancel_btn)
-
         ok_btn = QPushButton("Сохранить...")
         ok_btn.setFixedHeight(26)
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.on_ok)
         btns.addWidget(ok_btn)
-
         layout.addLayout(btns)
 
     def on_ok(self):
         fmt = DOTPACK_FORMAT if self.rb_dotpack.isChecked() else "zip"
-
-        # Проверяем, что выбрано хоть что-то
         any_selected = any((
-            self.cb_mods.isChecked(),
-            self.cb_config.isChecked(),
-            self.cb_resourcepacks.isChecked(),
-            self.cb_shaderpacks.isChecked(),
-            self.cb_defaultconfigs.isChecked(),
-            self.cb_kubejs.isChecked(),
-            self.cb_scripts.isChecked(),
-            self.cb_saves.isChecked(),
-            self.cb_screenshots.isChecked(),
-            self.cb_servers.isChecked(),
+            self.cb_mods.isChecked(), self.cb_config.isChecked(),
+            self.cb_resourcepacks.isChecked(), self.cb_shaderpacks.isChecked(),
+            self.cb_defaultconfigs.isChecked(), self.cb_kubejs.isChecked(),
+            self.cb_scripts.isChecked(), self.cb_saves.isChecked(),
+            self.cb_screenshots.isChecked(), self.cb_servers.isChecked(),
             self.cb_options.isChecked(),
         ))
         if not any_selected:
@@ -5355,10 +5527,9 @@ class ExportInstanceDialog(QDialog):
                 "Отметьте хотя бы один пункт для экспорта."
             )
             return
-
         self.result_data = {
             "format": fmt,
-            "fat": True,  # всегда с содержимым; thin пока не поддерживаем
+            "fat": True,
             "include_mods": self.cb_mods.isChecked(),
             "include_config": self.cb_config.isChecked(),
             "include_resourcepacks": self.cb_resourcepacks.isChecked(),
@@ -5375,7 +5546,7 @@ class ExportInstanceDialog(QDialog):
 
 
 # ============================================================
-#  ОКНО: СОЗДАНИЕ СБОРКИ
+#  ОКНО СОЗДАНИЯ СБОРКИ
 # ============================================================
 class NewInstanceDialog(QDialog):
     def __init__(self, parent=None):
@@ -5386,7 +5557,7 @@ class NewInstanceDialog(QDialog):
         self._all_versions = []
         self._fetch_thread = None
         self.loader_compat_thread = None
-        self.loader_mc_versions = {}  # loader_id -> set | None
+        self.loader_mc_versions = {}
         self._closed = False
         self.init_ui()
         self.load_versions()
@@ -5395,26 +5566,22 @@ class NewInstanceDialog(QDialog):
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
-
         header = QLabel("Создание новой сборки")
         header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        header.setProperty("class", "groupHeader")
         layout.addWidget(header)
 
         columns = QHBoxLayout()
         columns.setSpacing(8)
-
         left = QVBoxLayout()
         left.setSpacing(4)
-
         left.addWidget(QLabel("Версия Minecraft:"))
-
         self.version_list = QListWidget()
         self.version_list.itemSelectionChanged.connect(self._on_mc_selection_changed)
         left.addWidget(self.version_list, 1)
 
         types_label = QLabel("Типы версий:")
         left.addWidget(types_label)
-
         types_row = QHBoxLayout()
         types_row.setSpacing(6)
         self.cb_release = QCheckBox("Релизы")
@@ -5430,21 +5597,17 @@ class NewInstanceDialog(QDialog):
 
         right = QVBoxLayout()
         right.setSpacing(4)
-
         right.addWidget(QLabel("Настройки"))
-
         right.addSpacing(6)
         right.addWidget(QLabel("Название сборки:"))
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Моя сборка")
         right.addWidget(self.name_input)
-
         right.addSpacing(8)
         right.addWidget(QLabel("Загрузчик:"))
         self.loader_combo = QComboBox()
         self.loader_combo.addItems(list(MOD_LOADERS.values()))
         right.addWidget(self.loader_combo)
-
         right.addStretch()
 
         self.status_label = QLabel("")
@@ -5478,7 +5641,6 @@ class NewInstanceDialog(QDialog):
         if not isinstance(result, dict):
             return
         self.loader_mc_versions = result
-
         all_failed = all(v is None for v in result.values())
         if all_failed:
             self.status_label.setText(
@@ -5486,14 +5648,12 @@ class NewInstanceDialog(QDialog):
             )
         else:
             self.status_label.setText("Список версий и совместимость загружены.")
-
         self._refresh_loader_combo()
 
     def load_versions(self):
         self.version_list.clear()
         self.version_list.addItem("Загрузка списка версий...")
         self.version_list.setEnabled(False)
-
         self._fetch_thread = VersionFetchThread()
         self._fetch_thread.finished_signal.connect(self.on_versions_loaded)
         self._fetch_thread.start()
@@ -5524,13 +5684,10 @@ class NewInstanceDialog(QDialog):
     def _refresh_versions(self):
         if not self._all_versions:
             return
-
         allowed = self._selected_types()
         prev_selected = self._selected_mc_version()
-
         self.version_list.blockSignals(True)
         self.version_list.clear()
-
         if not allowed:
             self.version_list.addItem("Выберите хотя бы один тип версий")
         else:
@@ -5542,8 +5699,6 @@ class NewInstanceDialog(QDialog):
                 if not vid:
                     continue
                 self.version_list.addItem(vid)
-
-        # Пытаемся вернуть прежний выбор
         restored = False
         if prev_selected:
             for i in range(self.version_list.count()):
@@ -5552,12 +5707,10 @@ class NewInstanceDialog(QDialog):
                     self.version_list.setCurrentItem(item)
                     restored = True
                     break
-
         if not restored and self.version_list.count() > 0:
             first = self.version_list.item(0)
             if first and not first.text().startswith("Выберите"):
                 self.version_list.setCurrentRow(0)
-
         self.version_list.blockSignals(False)
         self._refresh_loader_combo()
 
@@ -5579,34 +5732,27 @@ class NewInstanceDialog(QDialog):
     def _refresh_loader_combo(self):
         mc = self._selected_mc_version()
         prev_text = self.loader_combo.currentText() if self.loader_combo.count() else ""
-
         if mc is None:
-            # Версия не выбрана — показываем все загрузчики
             available = [MOD_LOADERS[lid]
                          for lid in ("vanilla", "fabric", "forge", "neoforge")]
         else:
-            # Vanilla всегда доступен
             available = [MOD_LOADERS["vanilla"]]
             for lid in ("fabric", "forge", "neoforge"):
                 data = self.loader_mc_versions.get(lid)
                 if data is None:
-                    # Данные не пришли — не фильтруем
                     available.append(MOD_LOADERS[lid])
                 elif mc in data:
                     available.append(MOD_LOADERS[lid])
-
         self.loader_combo.blockSignals(True)
         self.loader_combo.clear()
         self.loader_combo.addItems(available)
         if prev_text in available:
             self.loader_combo.setCurrentText(prev_text)
         self.loader_combo.blockSignals(False)
-
         if mc is not None and len(available) == 1:
             self.status_label.setText(
                 f"Для Minecraft {mc} доступен только режим без загрузчика."
             )
-
         self._update_create_button_state()
 
     def _update_create_button_state(self):
@@ -5632,7 +5778,6 @@ class NewInstanceDialog(QDialog):
                 "Выберите версию Minecraft из списка слева."
             )
             return
-
         name = self.name_input.text().strip()
         if not name:
             QMessageBox.warning(
@@ -5640,7 +5785,6 @@ class NewInstanceDialog(QDialog):
                 "Введите название для новой сборки."
             )
             return
-
         loader_display = self.loader_combo.currentText()
         loader_id = None
         for lid, lname in MOD_LOADERS.items():
@@ -5648,16 +5792,10 @@ class NewInstanceDialog(QDialog):
                 loader_id = lid
                 break
         if not loader_id:
-            QMessageBox.warning(
-                self, "Ошибка",
-                "Не удалось определить загрузчик."
-            )
+            QMessageBox.warning(self, "Ошибка", "Не удалось определить загрузчик.")
             return
-
         self.result_data = {
-            "name": name,
-            "version": version,
-            "loader": loader_id,
+            "name": name, "version": version, "loader": loader_id,
         }
         self.accept()
 
@@ -5669,7 +5807,7 @@ class NewInstanceDialog(QDialog):
 
 
 # ============================================================
-#  ОКНО: СОЗДАНИЕ ПРОФИЛЯ
+#  ОКНО СОЗДАНИЯ ПРОФИЛЯ
 # ============================================================
 class AddProfileDialog(QDialog):
     def __init__(self, parent=None):
@@ -5684,7 +5822,6 @@ class AddProfileDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
-
         layout.addWidget(QLabel("Тип профиля:"))
         self.type_combo = QComboBox()
         self.type_combo.addItems(["Offline", "Ely.by"])
@@ -5714,7 +5851,6 @@ class AddProfileDialog(QDialog):
         layout.addWidget(self.elyby_widget)
 
         layout.addStretch()
-
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -5743,10 +5879,7 @@ class AddProfileDialog(QDialog):
             if not name:
                 QMessageBox.warning(self, "Ошибка", "Введите никнейм.")
                 return
-            self.result_data = {
-                "type": "offline",
-                "name": name,
-            }
+            self.result_data = {"type": "offline", "name": name}
             self.accept()
         else:
             email = self.email_input.text().strip()
@@ -5769,18 +5902,15 @@ class AddProfileDialog(QDialog):
         if not success:
             self.status_label.setText(f"Ошибка: {error}")
             return
-
         access_token = data.get("accessToken")
         refresh_token = data.get("refreshToken")
         selected = data.get("selectedProfile", {})
         uuid_val = selected.get("id")
         username = selected.get("name")
         new_client = data.get("clientToken")
-
         if not access_token or not uuid_val or not username:
             self.status_label.setText("Некорректный ответ Ely.by")
             return
-
         self.result_data = {
             "type": "elyby",
             "email": self.email_input.text().strip(),
@@ -5790,6 +5920,156 @@ class AddProfileDialog(QDialog):
             "refresh_token": refresh_token or "",
             "client_token": new_client or "",
         }
+        self.accept()
+
+
+# ============================================================
+#  ВЫБОР ТЕМЫ
+# ============================================================
+class ColorSwatch(QLabel):
+    picked = pyqtSignal(str)
+
+    def __init__(self, color, tooltip="", parent=None):
+        super().__init__(parent)
+        self.color = color
+        self.setFixedSize(38, 26)
+        self.setToolTip(tooltip or color)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            f"QLabel {{ background-color: {color}; "
+            f"border: 1px solid #333333; border-radius: 3px; }}"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.picked.emit(self.color)
+        super().mousePressEvent(event)
+
+
+class ThemeChooserDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        tm = ThemeManager.get()
+        self._family = tm.family
+        self._accent = tm.xp_accent
+        self.setWindowTitle("Стиль интерфейса")
+        self.setMinimumSize(520, 420)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        header = QLabel("Стиль интерфейса")
+        header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        header.setProperty("class", "groupHeader")
+        layout.addWidget(header)
+
+        layout.addWidget(QLabel("Семейство интерфейса:"))
+        self.rb_win98 = QRadioButton("Классика (Windows 98)")
+        self.rb_xp = QRadioButton("Windows XP Luna")
+        if self._family == ThemeManager.FAMILY_XP:
+            self.rb_xp.setChecked(True)
+        else:
+            self.rb_win98.setChecked(True)
+        self.rb_win98.toggled.connect(self._on_family_changed)
+        layout.addWidget(self.rb_win98)
+        layout.addWidget(self.rb_xp)
+
+        self.xp_box = QWidget()
+        xp_l = QVBoxLayout(self.xp_box)
+        xp_l.setContentsMargins(24, 0, 0, 0)
+        xp_l.setSpacing(6)
+        xp_l.addWidget(QLabel("Основной цвет:"))
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        self._swatches = {}
+        for i, (name, color) in enumerate(ThemeManager.XP_PRESETS):
+            sw = ColorSwatch(color, f"{name} ({color})")
+            sw.picked.connect(self._on_swatch_picked)
+            row = i // 5
+            col = i % 5
+            grid.addWidget(sw, row, col)
+            self._swatches[color.upper()] = sw
+        xp_l.addLayout(grid)
+
+        hex_row = QHBoxLayout()
+        hex_row.addWidget(QLabel("Другой цвет (hex):"))
+        self.hex_input = QLineEdit()
+        self.hex_input.setMaxLength(7)
+        self.hex_input.setPlaceholderText("#RRGGBB")
+        self.hex_input.setText(self._accent)
+        self.hex_input.textChanged.connect(self._on_hex_changed)
+        hex_row.addWidget(self.hex_input, 1)
+        xp_l.addLayout(hex_row)
+
+        self._highlight_selected_swatch()
+        layout.addWidget(self.xp_box)
+        layout.addStretch()
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedHeight(26)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.setFixedHeight(26)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.on_ok)
+        btns.addWidget(ok_btn)
+        layout.addLayout(btns)
+        self._on_family_changed()
+
+    def _on_family_changed(self):
+        is_xp = self.rb_xp.isChecked()
+        self.xp_box.setEnabled(is_xp)
+        if is_xp:
+            self._family = ThemeManager.FAMILY_XP
+        else:
+            self._family = ThemeManager.FAMILY_WIN98
+
+    def _on_swatch_picked(self, color):
+        self._accent = color.upper()
+        self.hex_input.blockSignals(True)
+        self.hex_input.setText(self._accent)
+        self.hex_input.blockSignals(False)
+        self._highlight_selected_swatch()
+
+    def _on_hex_changed(self, text):
+        text = text.strip()
+        if not text.startswith("#"):
+            text = "#" + text
+        if _is_valid_hex(text):
+            self._accent = text.upper()
+            self._highlight_selected_swatch()
+
+    def _highlight_selected_swatch(self):
+        for color_key, sw in self._swatches.items():
+            if color_key == self._accent:
+                sw.setStyleSheet(
+                    f"QLabel {{ background-color: {color_key}; "
+                    f"border: 3px solid #000000; border-radius: 3px; }}"
+                )
+            else:
+                sw.setStyleSheet(
+                    f"QLabel {{ background-color: {color_key}; "
+                    f"border: 1px solid #333333; border-radius: 3px; }}"
+                )
+
+    def on_ok(self):
+        if self.rb_xp.isChecked():
+            text = self.hex_input.text().strip()
+            if not text.startswith("#"):
+                text = "#" + text
+            if not _is_valid_hex(text):
+                QMessageBox.warning(
+                    self, "Ошибка",
+                    "Hex-цвет должен быть в формате #RRGGBB."
+                )
+                return
+            self._accent = text.upper()
+        ThemeManager.get().set_theme(self._family, self._accent)
         self.accept()
 
 
@@ -5804,17 +6084,7 @@ class DropZone(QLabel):
         self.setAcceptDrops(True)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFont(QFont("Tahoma", 9))
-        self.setStyleSheet("""
-            QLabel {
-                background-color: #ffffff;
-                color: #000000;
-                border-top: 2px solid #404040;
-                border-left: 2px solid #404040;
-                border-bottom: 2px solid #ffffff;
-                border-right: 2px solid #ffffff;
-                padding: 30px;
-            }
-        """)
+        self.setObjectName("dropZone")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -5830,7 +6100,7 @@ class DropZone(QLabel):
 
 
 # ============================================================
-#  СПИСОК МОДОВ С КЛИКОМ ЛЮБОЙ КНОПКОЙ
+#  СПИСОК МОДОВ
 # ============================================================
 class ModsListWidget(QListWidget):
     modRowClicked = pyqtSignal(int)
@@ -5862,7 +6132,6 @@ class DotLauncher(QMainWindow):
         self.refresh_thread = None
         self.import_thread = None
         self.mrpack_import_thread = None
-        # НОВОЕ: поток импорта .dotpack
         self.dotpack_import_thread = None
         self.instance_install_thread = None
         self.manifest_rebuild_thread = None
@@ -5875,37 +6144,27 @@ class DotLauncher(QMainWindow):
         self.init_ui()
         self.load_config()
 
-    # ---------- ИНТЕРФЕЙС ----------
+        ThemeManager.get().add_listener(self._on_theme_changed)
+
+    def _on_theme_changed(self):
+        try:
+            self.refresh_instance_list()
+            if self.mods_expanded:
+                self._populate_mods_list()
+        except Exception:
+            pass
+
     def init_ui(self):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(1000, 720)
-
-        palette = QPalette()
-        palette.setColor(QPalette.ColorRole.Window, QColor(192, 192, 192))
-        palette.setColor(QPalette.ColorRole.WindowText, QColor(0, 0, 0))
-        palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
-        palette.setColor(QPalette.ColorRole.AlternateBase, QColor(232, 232, 232))
-        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 225))
-        palette.setColor(QPalette.ColorRole.ToolTipText, QColor(0, 0, 0))
-        palette.setColor(QPalette.ColorRole.Text, QColor(0, 0, 0))
-        palette.setColor(QPalette.ColorRole.Button, QColor(192, 192, 192))
-        palette.setColor(QPalette.ColorRole.ButtonText, QColor(0, 0, 0))
-        palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
-        palette.setColor(QPalette.ColorRole.Link, QColor(0, 0, 255))
-        palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 0, 128))
-        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
-        self.setPalette(palette)
-
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(4, 4, 4, 4)
         main_layout.setSpacing(4)
-
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(3)
 
-        # ---------- ЛЕВАЯ ПАНЕЛЬ ----------
         left = QFrame()
         left.setFrameShape(QFrame.Shape.Panel)
         left.setFrameShadow(QFrame.Shadow.Raised)
@@ -5915,6 +6174,7 @@ class DotLauncher(QMainWindow):
 
         account_label = QLabel("Аккаунт")
         account_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        account_label.setProperty("class", "groupHeader")
         left_layout.addWidget(account_label)
 
         self.account_combo = QComboBox()
@@ -5923,25 +6183,22 @@ class DotLauncher(QMainWindow):
 
         acc_btns = QHBoxLayout()
         acc_btns.setSpacing(4)
-
         self.add_account_button = QPushButton("＋ Добавить")
         self.add_account_button.clicked.connect(self.add_account)
         acc_btns.addWidget(self.add_account_button)
-
         self.remove_account_button = QPushButton("Удалить")
         self.remove_account_button.clicked.connect(self.remove_account)
         acc_btns.addWidget(self.remove_account_button)
-
         left_layout.addLayout(acc_btns)
 
         self.login_status = QLabel("")
         self.login_status.setWordWrap(True)
         left_layout.addWidget(self.login_status)
-
         left_layout.addSpacing(8)
 
         memory_label = QLabel("Память (MB)")
         memory_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        memory_label.setProperty("class", "groupHeader")
         left_layout.addWidget(memory_label)
 
         self.memory_spin = QSpinBox()
@@ -5950,7 +6207,6 @@ class DotLauncher(QMainWindow):
         self.memory_spin.setValue(DEFAULT_MEMORY_MB)
         self.memory_spin.valueChanged.connect(self.save_memory)
         left_layout.addWidget(self.memory_spin)
-
         left_layout.addSpacing(4)
 
         self.java_button = QPushButton("Выбрать Java...")
@@ -5970,11 +6226,11 @@ class DotLauncher(QMainWindow):
         )
         self.managed_java_check.toggled.connect(self.save_managed_java)
         left_layout.addWidget(self.managed_java_check)
-
         left_layout.addSpacing(8)
 
         instances_label = QLabel("Сборки")
         instances_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        instances_label.setProperty("class", "groupHeader")
         left_layout.addWidget(instances_label)
 
         self.new_instance_button = QPushButton("＋ Новая сборка")
@@ -5998,18 +6254,14 @@ class DotLauncher(QMainWindow):
         self.mods_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self.mods_list.customContextMenuRequested.connect(
-            self.on_mods_context_menu
-        )
+        self.mods_list.customContextMenuRequested.connect(self.on_mods_context_menu)
         left_layout.addWidget(self.mods_list, 2)
 
         self.modrinth_button = QPushButton("Скачать из Modrinth")
         self.modrinth_button.clicked.connect(self.open_modrinth_window)
         left_layout.addWidget(self.modrinth_button)
-
         left_layout.addStretch()
 
-        # ---------- ЦЕНТРАЛЬНАЯ ПАНЕЛЬ ----------
         center = QFrame()
         center.setFrameShape(QFrame.Shape.Panel)
         center.setFrameShadow(QFrame.Shadow.Raised)
@@ -6023,7 +6275,6 @@ class DotLauncher(QMainWindow):
         center_layout.addWidget(self.title_label)
 
         self.drop_zone = DropZone(self)
-        # ОБНОВЛЕНО: упоминаем .dotpack
         self.drop_zone.setText(
             "Перетащи сюда .jar файлы модов, папку модпака,\n"
             ".zip-архив, .mrpack или .dotpack — чтобы создать сборку\n\n"
@@ -6046,7 +6297,6 @@ class DotLauncher(QMainWindow):
         self.instance_version_label.setFont(QFont("Tahoma", 10))
         self.instance_version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         info_layout.addWidget(self.instance_version_label)
-
         info_layout.addSpacing(20)
 
         self.play_button = QPushButton("ИГРАТЬ")
@@ -6064,6 +6314,7 @@ class DotLauncher(QMainWindow):
 
         console_label = QLabel("Консоль")
         console_label.setFont(QFont("Tahoma", 9, QFont.Weight.Bold))
+        console_label.setProperty("class", "groupHeader")
         center_layout.addWidget(console_label)
 
         self.console = QTextEdit()
@@ -6076,13 +6327,11 @@ class DotLauncher(QMainWindow):
         splitter.addWidget(center)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
-
         main_layout.addWidget(splitter)
 
         self.status_bar = self.statusBar()
         self.status_bar.showMessage("Готов")
 
-    # ---------- КОНФИГ ----------
     def _validate_config(self, cfg):
         if not isinstance(cfg, dict):
             return {}
@@ -6096,7 +6345,6 @@ class DotLauncher(QMainWindow):
         mem = safe_int(cfg.get("memory_mb"), DEFAULT_MEMORY_MB)
         out["memory_mb"] = max(MIN_MEMORY_MB, min(MAX_MEMORY_MB, mem))
         out["use_managed_java"] = bool(cfg.get("use_managed_java", False))
-
         accounts = cfg.get("accounts")
         if isinstance(accounts, list) and accounts:
             out["accounts"] = accounts
@@ -6106,7 +6354,6 @@ class DotLauncher(QMainWindow):
         if not (0 <= ai < len(out["accounts"])):
             ai = 0
         out["active_account"] = ai
-
         return out
 
     def load_config(self):
@@ -6115,7 +6362,8 @@ class DotLauncher(QMainWindow):
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 self.config = self._validate_config(raw)
-                if self.config.get("workspace") and os.path.isdir(self.config["workspace"]):
+                if (self.config.get("workspace")
+                        and os.path.isdir(self.config["workspace"])):
                     self.log("[dotLauncher] Конфигурация загружена.")
                     self.init_workspace()
                     return
@@ -6177,7 +6425,6 @@ class DotLauncher(QMainWindow):
                 self.log(f"[Ошибка] Не удалось загрузить базу сборок: {e}")
 
         self.refresh_instance_list()
-
         self.refresh_account_combo()
         acc = self._active_account()
         if acc and acc.get("type") == "elyby" and acc.get("refresh_token"):
@@ -6220,7 +6467,6 @@ class DotLauncher(QMainWindow):
                 "path_rel": path_rel,
                 "modsVerIdentified": bool(inst.get("modsVerIdentified", False)),
             }
-            # Per-instance Java (опциональные поля; отсутствие = "по умолчанию")
             jp = inst.get("java_path")
             if isinstance(jp, str) and jp:
                 entry["java_path"] = jp
@@ -6262,7 +6508,6 @@ class DotLauncher(QMainWindow):
     def _instance_abs_path(self, inst):
         return os.path.join(self.config["workspace"], inst["path_rel"])
 
-    # ---------- JAVA ----------
     def choose_java(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Выберите исполняемый файл Java", "",
@@ -6292,55 +6537,26 @@ class DotLauncher(QMainWindow):
         return find_java()
 
     def _resolve_java_for_instance(self, inst, minecraft_dir):
-        """
-        Определяет Java для конкретного инстанса.
-
-        Возвращает кортеж:
-            (java_path, java_major, source, required_major)
-
-        source:
-            "instance"  — своя Java инстанса
-            "managed"   — скачивать managed (java_path = None)
-            "global"    — глобальная Java
-            "auto"      — автоопределение
-            None        — ничего не найдено
-
-        required_major — требуемая major-версия для MC инстанса или None.
-        """
         mc_version = inst.get("version")
         required_major = get_required_java_major(minecraft_dir, mc_version)
-
-        # 1. Своя Java инстанса
         jp = inst.get("java_path")
         if isinstance(jp, str) and jp:
             if os.path.isfile(jp):
                 major = get_java_major(jp)
                 return jp, major, "instance", required_major
-            # Путь сохранён, но файл пропал — сообщаем и идём дальше
-            self.log(
-                f"[Внимание] Java инстанса не найдена: {jp!r}, ищу дальше."
-            )
-
-        # 2. Managed Java, включённая на инстансе
+            self.log(f"[Внимание] Java инстанса не найдена: {jp!r}, ищу дальше.")
         if inst.get("use_managed_java") is True:
             return None, None, "managed", required_major
-
-        # 3. Если на инстансе выбор не зафиксирован — используем глобальный managed
         if (inst.get("use_managed_java") is None
                 and self.managed_java_check.isChecked()):
             return None, None, "managed", required_major
-
-        # 4. Глобальная Java
         jp = self.config.get("java_path")
         if jp and os.path.isfile(jp):
             major = get_java_major(jp)
             return jp, major, "global", required_major
-
-        # 5. Автоопределение (с учётом требуемой версии)
         path, major = find_java(min_major=required_major or 17)
         if path:
             return path, major, "auto", required_major
-
         return None, None, None, required_major
 
     def _open_instance_java_settings(self, instance_id):
@@ -6349,18 +6565,14 @@ class DotLauncher(QMainWindow):
         inst = self.instances[instance_id]
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
-
         global_java_path = self.config.get("java_path")
-
         dlg = InstanceJavaDialog(
-            inst["name"], inst, minecraft_dir, global_java_path,
-            parent=self,
+            inst["name"], inst, minecraft_dir, global_java_path, parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if not dlg.result_data:
             return
-
         data = dlg.result_data
         if data.get("java_path"):
             inst["java_path"] = data["java_path"]
@@ -6371,13 +6583,9 @@ class DotLauncher(QMainWindow):
         else:
             inst["java_path"] = None
             inst["use_managed_java"] = False
-
         self.save_instances()
-        self.log(
-            f"[dotLauncher] Настройки Java для «{inst['name']}» сохранены."
-        )
+        self.log(f"[dotLauncher] Настройки Java для «{inst['name']}» сохранены.")
 
-    # ---------- АККАУНТЫ ----------
     def _active_account(self):
         accounts = self.config.get("accounts", [])
         idx = safe_int(self.config.get("active_account"), 0)
@@ -6388,7 +6596,6 @@ class DotLauncher(QMainWindow):
     def refresh_account_combo(self):
         self.account_combo.blockSignals(True)
         self.account_combo.clear()
-
         accounts = self.config.get("accounts", [])
         for acc in accounts:
             if acc.get("type") == "offline":
@@ -6398,12 +6605,10 @@ class DotLauncher(QMainWindow):
                 name = acc.get("username") or acc.get("email") or "?"
                 display = f"{name} [Ely.by]"
             self.account_combo.addItem(display)
-
         ai = safe_int(self.config.get("active_account"), 0)
         if 0 <= ai < len(accounts):
             self.account_combo.setCurrentIndex(ai)
         self.account_combo.blockSignals(False)
-
         self.update_login_status()
 
     def update_login_status(self):
@@ -6415,9 +6620,7 @@ class DotLauncher(QMainWindow):
             name = acc.get("name") or "(имя не задано)"
             self.login_status.setText(f"Offline: {name}")
         else:
-            self.login_status.setText(
-                f"Ely.by: {acc.get('username', '?')}"
-            )
+            self.login_status.setText(f"Ely.by: {acc.get('username', '?')}")
 
     def on_account_changed(self, idx):
         if idx < 0:
@@ -6425,7 +6628,6 @@ class DotLauncher(QMainWindow):
         self.config["active_account"] = idx
         self.save_config()
         self.update_login_status()
-
         acc = self._active_account()
         if acc and acc.get("type") == "elyby" and acc.get("refresh_token"):
             self._refresh_elyby_silent(acc)
@@ -6436,13 +6638,11 @@ class DotLauncher(QMainWindow):
             return
         if not dlg.result_data:
             return
-
         accounts = self.config.setdefault("accounts", [])
         accounts.append(dlg.result_data)
         self.config["active_account"] = len(accounts) - 1
         self.save_config()
         self.refresh_account_combo()
-
         data = dlg.result_data
         name = data.get("name") or data.get("username") or "?"
         self.log(f"[dotLauncher] Добавлен профиль: {name}")
@@ -6499,12 +6699,10 @@ class DotLauncher(QMainWindow):
             return
         if not acc.get("refresh_token"):
             return
-
         client_token = acc.get("client_token")
         access_token = acc.get("access_token")
         if not client_token or not access_token:
             return
-
         try:
             url = "https://authserver.ely.by/auth/refresh"
             payload = {
@@ -6528,14 +6726,14 @@ class DotLauncher(QMainWindow):
         except Exception as e:
             self.log(f"[Внимание] Не удалось обновить сессию Ely.by: {e}")
 
-    # ---------- МАНИФЕСТ МОДОВ ----------
     def _ensure_manifest_for_current_instance(self):
         if not self.current_instance or self.current_instance not in self.instances:
             return
         inst = self.instances[self.current_instance]
         if inst.get("modsVerIdentified"):
             return
-        if self.manifest_rebuild_thread and self.manifest_rebuild_thread.isRunning():
+        if (self.manifest_rebuild_thread
+                and self.manifest_rebuild_thread.isRunning()):
             return
         self._start_manifest_rebuild(self.current_instance)
 
@@ -6545,16 +6743,12 @@ class DotLauncher(QMainWindow):
         inst = self.instances[instance_id]
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
-
         if not os.path.isdir(minecraft_dir):
             inst["modsVerIdentified"] = True
             self.save_instances()
             return
-
         loader_id = inst.get("loader", "fabric")
-        self.log(
-            f"[dotLauncher] Индексирование модов сборки «{inst['name']}»..."
-        )
+        self.log(f"[dotLauncher] Индексирование модов сборки «{inst['name']}»...")
         self.manifest_rebuild_thread = ModManifestRebuildThread(
             instance_id, instance_dir, minecraft_dir, loader_id
         )
@@ -6578,7 +6772,6 @@ class DotLauncher(QMainWindow):
                     f"[Внимание] Не удалось проиндексировать моды "
                     f"сборки «{inst['name']}»: {error}"
                 )
-
         if (self.current_instance
                 and self.current_instance != instance_id
                 and self.current_instance in self.instances
@@ -6589,12 +6782,10 @@ class DotLauncher(QMainWindow):
                                      loader_id, disabled):
         manifest = load_mod_manifest(instance_dir)
         entry = manifest.get("mods", {}).get(filename)
-
         try:
             actual_sha1 = sha1_file(mod_path)
         except Exception:
             actual_sha1 = None
-
         need_rebuild = False
         if not isinstance(entry, dict):
             need_rebuild = True
@@ -6608,7 +6799,6 @@ class DotLauncher(QMainWindow):
                 save_mod_manifest(instance_dir, manifest)
             except Exception:
                 pass
-
         if need_rebuild:
             entry = build_mod_manifest_entry(
                 mod_path, loader_hint=loader_id, disabled=disabled
@@ -6618,12 +6808,9 @@ class DotLauncher(QMainWindow):
                 save_mod_manifest(instance_dir, manifest)
             except Exception:
                 pass
-
         return entry
 
-    # ---------- DRAG-AND-DROP / ИМПОРТ ----------
     def _any_import_running(self):
-        # ОБНОВЛЕНО: теперь учитываем и dotpack
         return (
             (self.import_thread is not None and self.import_thread.isRunning())
             or (self.mrpack_import_thread is not None
@@ -6646,7 +6833,6 @@ class DotLauncher(QMainWindow):
             self.log("[Ошибка] Идёт экспорт. Дождитесь завершения.")
             return
 
-        # ОБНОВЛЕНО: классифицируем .mrpack, .dotpack и прочее
         mrpack_files = []
         dotpack_files = []
         other_files = []
@@ -6661,7 +6847,6 @@ class DotLauncher(QMainWindow):
                     continue
             other_files.append(f)
 
-        # Приоритет: .mrpack > .dotpack > обычный импорт.
         if mrpack_files:
             if len(mrpack_files) > 1:
                 self.log(
@@ -6694,7 +6879,6 @@ class DotLauncher(QMainWindow):
                 )
             return
 
-        # Обычный импорт
         relevant = []
         for f in other_files:
             if os.path.isdir(f):
@@ -6723,7 +6907,6 @@ class DotLauncher(QMainWindow):
         self.import_thread.start()
 
     def import_modpack_dialog(self):
-        # ОБНОВЛЕНО: добавили .dotpack в фильтр
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Выберите модпак, архив или моды для импорта",
@@ -6755,18 +6938,14 @@ class DotLauncher(QMainWindow):
         if self.export_thread and self.export_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Идёт экспорт.")
             return
-
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Выберите модпак .mrpack",
-            "",
+            self, "Выберите модпак .mrpack", "",
             "Modrinth Modpack (*.mrpack);;Все файлы (*)",
         )
         if not path:
             return
         self._start_mrpack_import(path)
 
-    # НОВОЕ: диалог импорта .dotpack
     def import_dotpack_dialog(self):
         if self._any_import_running():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения текущего импорта.")
@@ -6780,11 +6959,8 @@ class DotLauncher(QMainWindow):
         if self.export_thread and self.export_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Идёт экспорт.")
             return
-
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Выберите сборку .dotpack",
-            "",
+            self, "Выберите сборку .dotpack", "",
             "dotLauncher Pack (*.dotpack);;Все файлы (*)",
         )
         if not path:
@@ -6801,7 +6977,6 @@ class DotLauncher(QMainWindow):
         self.play_button.setEnabled(False)
         self.new_instance_button.setEnabled(False)
         self.status_bar.showMessage("Импорт .mrpack...")
-
         self.mrpack_import_thread = MrpackImportThread(
             mrpack_path,
             self.config["instances_dir"],
@@ -6809,22 +6984,18 @@ class DotLauncher(QMainWindow):
             self.instances.keys(),
         )
         self.mrpack_import_thread.log_signal.connect(self.log)
-        self.mrpack_import_thread.status_signal.connect(
-            self.status_bar.showMessage
-        )
+        self.mrpack_import_thread.status_signal.connect(self.status_bar.showMessage)
         self.mrpack_import_thread.progress_signal.connect(self.update_progress)
         self.mrpack_import_thread.ask_signal.connect(self.on_mrpack_ask)
         self.mrpack_import_thread.finished_signal.connect(self.on_mrpack_finished)
         self.mrpack_import_thread.start()
 
-    # НОВОЕ: запуск импорта .dotpack
     def _start_dotpack_import(self, dotpack_path):
         self.play_button.setEnabled(False)
         self.new_instance_button.setEnabled(False)
         self.status_bar.showMessage("Импорт .dotpack...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-
         self.dotpack_import_thread = DotpackImportThread(
             dotpack_path,
             self.config["instances_dir"],
@@ -6841,9 +7012,7 @@ class DotLauncher(QMainWindow):
         thread = self.mrpack_import_thread
         if thread is None:
             return
-
         self.progress_bar.setVisible(False)
-
         dlg = MrpackConfirmDialog(info, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             thread.cancel()
@@ -6851,20 +7020,16 @@ class DotLauncher(QMainWindow):
         if not dlg.result_data:
             thread.cancel()
             return
-
         thread.set_user_choice(
             dlg.result_data.get("name", ""),
             dlg.result_data.get("optionals", []),
         )
 
-    # НОВОЕ: обработка вопроса от .dotpack-потока
     def on_dotpack_ask(self, info):
         thread = self.dotpack_import_thread
         if thread is None:
             return
-
         self.progress_bar.setVisible(False)
-
         dlg = DotpackConfirmDialog(info, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             thread.cancel()
@@ -6872,7 +7037,6 @@ class DotLauncher(QMainWindow):
         if not dlg.result_data:
             thread.cancel()
             return
-
         thread.set_user_choice(dlg.result_data.get("name", ""))
 
     def on_mrpack_finished(self, success, info, error):
@@ -6880,21 +7044,17 @@ class DotLauncher(QMainWindow):
         self.new_instance_button.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage("Готов")
-
         if not success:
             if error:
                 self.log(f"[dotLauncher] Импорт .mrpack не завершён: {error}")
             return
-
         if not isinstance(info, dict):
             self.log("[Ошибка] Импорт .mrpack вернул некорректные данные.")
             return
-
         iid = info.get("instance_id")
         if not iid:
             self.log("[Ошибка] Импорт .mrpack: нет instance_id.")
             return
-
         self.instances[iid] = {
             "name": info.get("name", "Imported Modpack"),
             "version": info.get("version", ""),
@@ -6907,30 +7067,23 @@ class DotLauncher(QMainWindow):
         self.refresh_instance_list()
         self.log(f"[dotLauncher] Сборка «{info.get('name')}» добавлена из .mrpack.")
 
-    # НОВОЕ: завершение импорта .dotpack
     def on_dotpack_finished(self, success, info, error):
         self.play_button.setEnabled(True)
         self.new_instance_button.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage("Готов")
-
         if not success:
             if error:
                 self.log(f"[dotLauncher] Импорт .dotpack не завершён: {error}")
             return
-
         if not isinstance(info, dict):
             self.log("[Ошибка] Импорт .dotpack вернул некорректные данные.")
             return
-
         iid = info.get("instance_id")
         if not iid:
             self.log("[Ошибка] Импорт .dotpack: нет instance_id.")
             return
-
-        # Переносим флаг modsVerIdentified, если поток его указал
         mods_identified = bool(info.get("modsVerIdentified", False))
-
         self.instances[iid] = {
             "name": info.get("name", "Imported Dotpack"),
             "version": info.get("version", ""),
@@ -6941,11 +7094,7 @@ class DotLauncher(QMainWindow):
         }
         self.save_instances()
         self.refresh_instance_list()
-        self.log(
-            f"[dotLauncher] Сборка «{info.get('name')}» добавлена из .dotpack."
-        )
-
-        # Если манифеста не было — просим переиндексировать
+        self.log(f"[dotLauncher] Сборка «{info.get('name')}» добавлена из .dotpack.")
         if not mods_identified:
             self._select_instance_by_id(iid)
             self._ensure_manifest_for_current_instance()
@@ -6954,7 +7103,6 @@ class DotLauncher(QMainWindow):
         thread = self.import_thread
         if thread is None:
             return
-
         if len(loaders) > 1:
             loader_names = [MOD_LOADERS.get(l, l) for l in loaders]
             chosen_loader_name, ok = QInputDialog.getItem(
@@ -6996,18 +7144,15 @@ class DotLauncher(QMainWindow):
         if not ok or not name.strip():
             thread.cancel()
             return
-
         thread.set_user_choice(chosen_version, chosen_loader, name)
 
     def on_import_finished(self, success, info):
         self.play_button.setEnabled(True)
         self.status_bar.showMessage("Готов")
-
         if not success:
             msg = info.get("error", "Ошибка импорта")
             self.log(f"[dotLauncher] Импорт не завершён: {msg}")
             return
-
         iid = info["instance_id"]
         self.instances[iid] = {
             "name": info["name"],
@@ -7021,7 +7166,6 @@ class DotLauncher(QMainWindow):
         self.refresh_instance_list()
         self.log(f"[dotLauncher] Сборка «{info['name']}» добавлена.")
 
-    # ---------- ЭКСПОРТ СБОРКИ ----------
     def export_instance(self, instance_id):
         if instance_id not in self.instances:
             return
@@ -7037,7 +7181,6 @@ class DotLauncher(QMainWindow):
         if self.export_thread and self.export_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Экспорт уже выполняется.")
             return
-
         inst = self.instances[instance_id]
         if inst.get("installing"):
             QMessageBox.warning(
@@ -7045,7 +7188,6 @@ class DotLauncher(QMainWindow):
                 "Сборка ещё создаётся. Дождитесь завершения."
             )
             return
-
         instance_dir = self._instance_abs_path(inst)
         if not os.path.isdir(instance_dir):
             QMessageBox.warning(
@@ -7053,18 +7195,14 @@ class DotLauncher(QMainWindow):
                 f"Папка сборки не существует:\n{instance_dir}"
             )
             return
-
         has_manifest = os.path.isfile(get_manifest_path(instance_dir))
-
         dlg = ExportInstanceDialog(inst, has_manifest, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if not dlg.result_data:
             return
-
         options = dlg.result_data
         fmt = options.get("format", DOTPACK_FORMAT)
-
         safe_name = sanitize_instance_name(inst.get("name", "instance"))
         if fmt == DOTPACK_FORMAT:
             default_filename = f"{safe_name}.dotpack"
@@ -7072,20 +7210,16 @@ class DotLauncher(QMainWindow):
         else:
             default_filename = f"{safe_name}.zip"
             file_filter = "ZIP archive (*.zip);;Все файлы (*)"
-
         output_path, _ = QFileDialog.getSaveFileName(
             self, "Сохранить сборку как", default_filename, file_filter
         )
         if not output_path:
             return
-
-        # Дополняем расширение, если пользователь его не указал
         low = output_path.lower()
         if fmt == DOTPACK_FORMAT and not low.endswith(".dotpack"):
             output_path += ".dotpack"
         elif fmt == "zip" and not low.endswith(".zip"):
             output_path += ".zip"
-
         if os.path.exists(output_path):
             reply = QMessageBox.question(
                 self, "Файл существует",
@@ -7094,7 +7228,6 @@ class DotLauncher(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-
         self._start_instance_export(inst, instance_dir, output_path, options)
 
     def _start_instance_export(self, inst, instance_dir, output_path, options):
@@ -7103,10 +7236,7 @@ class DotLauncher(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.status_bar.showMessage("Экспорт сборки...")
-        self.log(
-            f"[dotLauncher] Экспорт сборки «{inst['name']}» → {output_path}"
-        )
-
+        self.log(f"[dotLauncher] Экспорт сборки «{inst['name']}» → {output_path}")
         self.export_thread = InstanceExportThread(
             inst, instance_dir, self.config, output_path, options
         )
@@ -7124,12 +7254,8 @@ class DotLauncher(QMainWindow):
             QMessageBox.information(self, "Готово", "Экспорт завершён.")
         else:
             self.log(f"[dotLauncher] Экспорт не завершён: {error}")
-            QMessageBox.warning(
-                self, "Ошибка",
-                f"Экспорт не удался:\n{error}"
-            )
+            QMessageBox.warning(self, "Ошибка", f"Экспорт не удался:\n{error}")
 
-    # ---------- НОВАЯ СБОРКА ----------
     def open_new_instance_dialog(self):
         if self._any_import_running():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения импорта.")
@@ -7143,17 +7269,13 @@ class DotLauncher(QMainWindow):
         if self.export_thread and self.export_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Идёт экспорт.")
             return
-
         dlg = NewInstanceDialog(parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if not dlg.result_data:
             return
-
         data = dlg.result_data
-        self._start_instance_install(
-            data["name"], data["version"], data["loader"]
-        )
+        self._start_instance_install(data["name"], data["version"], data["loader"])
 
     def _start_instance_install(self, name, version, loader_id):
         java_path = None
@@ -7163,7 +7285,6 @@ class DotLauncher(QMainWindow):
                 java_path = resolved
             except Exception:
                 java_path = None
-
         existing = set(self.instances.keys())
         if os.path.isdir(self.config["instances_dir"]):
             try:
@@ -7173,7 +7294,6 @@ class DotLauncher(QMainWindow):
         instance_id = str(uuid.uuid4())[:8]
         while instance_id in existing:
             instance_id = str(uuid.uuid4())[:8]
-
         path_rel = os.path.join("instances", instance_id)
         self.instances[instance_id] = {
             "name": name,
@@ -7186,7 +7306,6 @@ class DotLauncher(QMainWindow):
         }
         self.save_instances()
         self.refresh_instance_list()
-
         self.play_button.setEnabled(False)
         self.new_instance_button.setEnabled(False)
         self.status_bar.showMessage(f"Создание сборки «{name}»...")
@@ -7195,20 +7314,13 @@ class DotLauncher(QMainWindow):
             f"Minecraft {version}, загрузчик "
             f"{MOD_LOADERS.get(loader_id, loader_id)}."
         )
-
         self.instance_install_thread = InstanceInstallThread(
             self.config["instances_dir"],
             self.config["workspace"],
-            instance_id,
-            version,
-            loader_id,
-            name,
-            java_path=java_path,
+            instance_id, version, loader_id, name, java_path=java_path,
         )
         self.instance_install_thread.log_signal.connect(self.log)
-        self.instance_install_thread.status_signal.connect(
-            self.status_bar.showMessage
-        )
+        self.instance_install_thread.status_signal.connect(self.status_bar.showMessage)
         self.instance_install_thread.finished_signal.connect(
             self.on_instance_install_finished
         )
@@ -7218,21 +7330,15 @@ class DotLauncher(QMainWindow):
         self.play_button.setEnabled(True)
         self.new_instance_button.setEnabled(True)
         self.status_bar.showMessage("Готов")
-
         iid = info.get("instance_id") if isinstance(info, dict) else None
-
         if not success:
             if iid and iid in self.instances:
                 del self.instances[iid]
                 self.save_instances()
                 self.refresh_instance_list()
             self.log(f"[dotLauncher] Создание сборки не завершено: {error}")
-            QMessageBox.warning(
-                self, "Ошибка",
-                f"Не удалось создать сборку:\n{error}"
-            )
+            QMessageBox.warning(self, "Ошибка", f"Не удалось создать сборку:\n{error}")
             return
-
         self.instances[iid] = {
             "name": info["name"],
             "version": info["version"],
@@ -7245,11 +7351,9 @@ class DotLauncher(QMainWindow):
         self.refresh_instance_list()
         self.log(f"[dotLauncher] Сборка «{info['name']}» создана.")
         QMessageBox.information(
-            self, "Готово",
-            f"Сборка «{info['name']}» создана."
+            self, "Готово", f"Сборка «{info['name']}» создана."
         )
 
-    # ---------- КОНТЕКСТНОЕ МЕНЮ: СБОРКИ ----------
     def on_instance_context_menu(self, pos):
         item = self.instance_list.itemAt(pos)
         menu = QMenu(self)
@@ -7263,8 +7367,9 @@ class DotLauncher(QMainWindow):
                 act_import_mrpack.setToolTip(
                     "Требуется minecraft-launcher-lib с модулем mrpack."
                 )
-            # НОВОЕ: пункт меню для импорта .dotpack
             act_import_dotpack = menu.addAction("Импорт .dotpack...")
+            menu.addSeparator()
+            act_theme = menu.addAction("Стиль интерфейса…")
 
             chosen = menu.exec(self.instance_list.mapToGlobal(pos))
             if chosen is None:
@@ -7277,6 +7382,8 @@ class DotLauncher(QMainWindow):
                 self.import_mrpack_dialog()
             elif chosen == act_import_dotpack:
                 self.import_dotpack_dialog()
+            elif chosen == act_theme:
+                self.open_theme_chooser()
             return
 
         instance_id = item.data(Qt.ItemDataRole.UserRole)
@@ -7308,15 +7415,11 @@ class DotLauncher(QMainWindow):
             act_expand = menu.addAction("Развернуть сборку")
 
         act_java = menu.addAction("Настройки Java...")
-
         act_export = menu.addAction("Экспортировать сборку...")
         act_export.setEnabled(not export_running)
-
         act_folder = menu.addAction("Открыть папку сборки")
         act_screenshots = menu.addAction("Открыть скриншоты")
-
         menu.addSeparator()
-
         act_delete = menu.addAction("Удалить сборку")
         act_delete.setEnabled(not launcher_running)
 
@@ -7343,6 +7446,15 @@ class DotLauncher(QMainWindow):
             self._select_instance_by_id(instance_id)
             self.delete_instance()
 
+    def open_theme_chooser(self):
+        dlg = ThemeChooserDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            ThemeManager.get().apply(app)
+        self.log("[dotLauncher] Стиль интерфейса обновлён.")
+
     def _select_instance_by_id(self, instance_id):
         for i in range(self.instance_list.count()):
             item = self.instance_list.item(i)
@@ -7353,41 +7465,32 @@ class DotLauncher(QMainWindow):
                 return True
         return False
 
-    # ---------- КОНТЕКСТНОЕ МЕНЮ: МОДЫ ----------
     def on_mods_context_menu(self, pos):
         item = self.mods_list.itemAt(pos)
         if item is None:
             return
-
         data = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(data, dict):
             return
-
         filename = data.get("filename")
         disabled = data.get("disabled", False)
         if not filename:
             return
 
         menu = QMenu(self)
-
         if disabled:
             act_toggle = menu.addAction("Включить мод")
         else:
             act_toggle = menu.addAction("Выключить мод")
-
         act_change_version = menu.addAction("Изменить версию")
         act_change_version.setEnabled(not disabled)
-
         act_open = menu.addAction("Открыть расположение файла")
-
         menu.addSeparator()
-
         act_delete = menu.addAction("Удалить мод")
 
         chosen = menu.exec(self.mods_list.mapToGlobal(pos))
         if chosen is None:
             return
-
         if chosen == act_toggle:
             row = self.mods_list.row(item)
             self.on_mod_row_clicked(row)
@@ -7410,41 +7513,34 @@ class DotLauncher(QMainWindow):
         if self.launcher_thread and self.launcher_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
             return
-
-        if self.manifest_rebuild_thread and self.manifest_rebuild_thread.isRunning():
+        if (self.manifest_rebuild_thread
+                and self.manifest_rebuild_thread.isRunning()):
             QMessageBox.information(
                 self, "Подождите",
                 "Идёт индексирование модов сборки. Подождите немного\n"
                 "и попробуйте снова."
             )
             return
-
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
         mod_path = os.path.join(minecraft_dir, "mods", filename)
-
         if not os.path.isfile(mod_path):
             QMessageBox.warning(
-                self, "Файл не найден",
-                f"Файл мода не найден:\n{mod_path}"
+                self, "Файл не найден", f"Файл мода не найден:\n{mod_path}"
             )
             return
-
         entry = self._get_or_build_manifest_entry(
             instance_dir, mod_path, filename,
             inst.get("loader", "fabric"), disabled=False
         )
-
         dlg = ModVersionChangeDialog(
             instance_dir, mod_path, inst["loader"], inst["version"],
             manifest_entry=entry, parent=self
         )
         result = dlg.exec()
         if result == QDialog.DialogCode.Accepted:
-            self.log(
-                f"[dotLauncher] Версия мода «{filename}» изменена."
-            )
+            self.log(f"[dotLauncher] Версия мода «{filename}» изменена.")
             if self.current_instance in self.instances:
                 self.instances[self.current_instance]["modsVerIdentified"] = False
                 self.save_instances()
@@ -7462,8 +7558,7 @@ class DotLauncher(QMainWindow):
         full_path = os.path.join(minecraft_dir, sub, filename)
         if not os.path.isfile(full_path):
             QMessageBox.warning(
-                self, "Файл не найден",
-                f"Файл мода не найден:\n{full_path}"
+                self, "Файл не найден", f"Файл мода не найден:\n{full_path}"
             )
             return
         try:
@@ -7476,10 +7571,7 @@ class DotLauncher(QMainWindow):
             else:
                 subprocess.Popen(["xdg-open", os.path.dirname(full_path)])
         except Exception as e:
-            QMessageBox.warning(
-                self, "Ошибка",
-                f"Не удалось открыть папку:\n{e}"
-            )
+            QMessageBox.warning(self, "Ошибка", f"Не удалось открыть папку:\n{e}")
 
     def delete_mod(self, filename, disabled):
         if not self.current_instance or self.current_instance not in self.instances:
@@ -7491,8 +7583,7 @@ class DotLauncher(QMainWindow):
         full_path = os.path.join(minecraft_dir, sub, filename)
         if not os.path.isfile(full_path):
             QMessageBox.warning(
-                self, "Файл не найден",
-                f"Файл мода не найден:\n{full_path}"
+                self, "Файл не найден", f"Файл мода не найден:\n{full_path}"
             )
             return
         reply = QMessageBox.question(
@@ -7506,37 +7597,31 @@ class DotLauncher(QMainWindow):
             os.remove(full_path)
             self.log(f"[dotLauncher] Мод {filename} удалён.")
         except Exception as e:
-            QMessageBox.warning(
-                self, "Ошибка",
-                f"Не удалось удалить файл:\n{e}"
-            )
+            QMessageBox.warning(self, "Ошибка", f"Не удалось удалить файл:\n{e}")
             return
-
         try:
             manifest = load_mod_manifest(instance_dir)
             remove_manifest_entry(manifest, filename)
             save_mod_manifest(instance_dir, manifest)
         except Exception:
             pass
-
         if self.mods_expanded:
             self._populate_mods_list()
 
-    # ---------- СПИСОК СБОРОК ----------
     def refresh_instance_list(self):
         self.instance_list.clear()
+        colors = ThemeManager.get().colors()
         for iid, inst in self.instances.items():
             item = QListWidgetItem(inst["name"])
             item.setData(Qt.ItemDataRole.UserRole, iid)
             if inst.get("installing"):
                 item.setText(f"{inst['name']}  [СКАЧИВАЕТСЯ]")
                 item.setToolTip("Сборка создаётся, дождитесь завершения.")
-                item.setForeground(QColor("#808080"))
+                item.setForeground(QColor(colors["disabledFg"]))
                 f = item.font()
                 f.setItalic(True)
                 item.setFont(f)
             self.instance_list.addItem(item)
-
         if self.current_instance and self.current_instance in self.instances:
             for i in range(self.instance_list.count()):
                 item = self.instance_list.item(i)
@@ -7557,7 +7642,6 @@ class DotLauncher(QMainWindow):
                 return
             self.current_instance = instance_id
             self.instance_name_label.setText(inst["name"])
-
             if inst.get("loader") == VANILLA_LOADER_ID:
                 ver_text = f"Minecraft {inst['version']} (без загрузчика)"
             else:
@@ -7565,19 +7649,15 @@ class DotLauncher(QMainWindow):
                 ver_text = f"{loader_name} {inst['version']}"
                 if inst.get("loader_version"):
                     ver_text += f" (loader {inst['loader_version']})"
-
             self.instance_version_label.setText(ver_text)
             self.drop_zone.setVisible(False)
             self.instance_info.setVisible(True)
             self.title_label.setVisible(False)
             self.status_bar.showMessage(f"Выбрана сборка: {inst['name']}")
-
             if self.mods_expanded:
                 self._populate_mods_list()
-
             self._ensure_manifest_for_current_instance()
 
-    # ---------- РАЗВОРОТ СБОРКИ / УПРАВЛЕНИЕ МОДАМИ ----------
     def toggle_expand(self):
         if not self.current_instance:
             return
@@ -7592,16 +7672,13 @@ class DotLauncher(QMainWindow):
 
     def _populate_mods_list(self):
         self.mods_list.clear()
-
         if not self.current_instance or self.current_instance not in self.instances:
             return
-
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
         mods_dir = os.path.join(minecraft_dir, "mods")
         disabled_dir = os.path.join(minecraft_dir, "disabledMods")
-
         entries = []
         if os.path.isdir(mods_dir):
             try:
@@ -7617,12 +7694,9 @@ class DotLauncher(QMainWindow):
                         entries.append((f, True))
             except OSError:
                 pass
-
         entries.sort(key=lambda e: (e[1], e[0].lower()))
-
         for fn, is_disabled in entries:
             self._add_mod_item(fn, is_disabled)
-
         if not entries:
             placeholder = QListWidgetItem("— нет модов —")
             placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -7634,22 +7708,18 @@ class DotLauncher(QMainWindow):
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
         sub = "disabledMods" if disabled else "mods"
         full_path = os.path.join(minecraft_dir, sub, filename)
-
         display_name = None
         if os.path.isfile(full_path):
             try:
                 display_name = read_mod_display_name(full_path)
             except Exception:
                 display_name = None
-
         if display_name and display_name != filename:
             text = f"{display_name}  [{filename}]"
         else:
             text = filename
-
         if disabled:
             text = f"[ВЫКЛ]  {text}"
-
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, {
             "filename": filename,
@@ -7658,13 +7728,12 @@ class DotLauncher(QMainWindow):
         item.setToolTip(
             "Клик — " + ("включить" if disabled else "выключить") + " мод"
         )
-
         f = item.font()
         f.setItalic(disabled)
         item.setFont(f)
         if disabled:
-            item.setForeground(QColor("#808080"))
-
+            colors = ThemeManager.get().colors()
+            item.setForeground(QColor(colors["disabledFg"]))
         return item
 
     def _add_mod_item(self, filename, disabled):
@@ -7676,33 +7745,27 @@ class DotLauncher(QMainWindow):
             return
         if row < 0 or row >= self.mods_list.count():
             return
-
         item = self.mods_list.item(row)
         if item is None:
             return
         data = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(data, dict):
             return
-
         filename = data.get("filename")
         disabled = data.get("disabled", False)
         if not filename:
             return
-
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
         mods_dir = os.path.join(minecraft_dir, "mods")
         disabled_dir = os.path.join(minecraft_dir, "disabledMods")
-
         src_dir = disabled_dir if disabled else mods_dir
         dst_dir = mods_dir if disabled else disabled_dir
         src = os.path.join(src_dir, filename)
-
         if not os.path.isfile(src):
             self.log(f"[Внимание] Файл мода не найден: {src}")
             return
-
         try:
             os.makedirs(dst_dir, exist_ok=True)
             target_name = filename
@@ -7717,7 +7780,6 @@ class DotLauncher(QMainWindow):
             shutil.move(src, target)
             state = "выключен" if not disabled else "включён"
             self.log(f"[dotLauncher] Мод {target_name} {state}.")
-
             try:
                 manifest = load_mod_manifest(instance_dir)
                 entry = manifest.get("mods", {}).get(filename)
@@ -7736,14 +7798,15 @@ class DotLauncher(QMainWindow):
         new_disabled = not disabled
         new_item = self._make_mod_item(target_name, new_disabled)
         item.setText(new_item.text())
-        item.setData(Qt.ItemDataRole.UserRole, new_item.data(Qt.ItemDataRole.UserRole))
+        item.setData(Qt.ItemDataRole.UserRole,
+                     new_item.data(Qt.ItemDataRole.UserRole))
         item.setToolTip(new_item.toolTip())
         item.setFont(new_item.font())
+        colors = ThemeManager.get().colors()
         if new_disabled:
-            item.setForeground(QColor("#808080"))
+            item.setForeground(QColor(colors["disabledFg"]))
         else:
-            item.setForeground(QColor("#000000"))
-
+            item.setForeground(QColor(colors["enabledFg"]))
         self.mods_list.update()
 
     def delete_instance(self):
@@ -7752,7 +7815,6 @@ class DotLauncher(QMainWindow):
         if self.launcher_thread and self.launcher_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
             return
-
         inst = self.instances[self.current_instance]
         reply = QMessageBox.question(
             self, "Удаление сборки",
@@ -7761,13 +7823,14 @@ class DotLauncher(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-
         path = self._instance_abs_path(inst)
         instances_dir = self.config["instances_dir"]
         deletion_ok = True
-
         if not is_subpath(path, instances_dir):
-            self.log(f"[Ошибка] Небезопасный путь сборки: {path!r}, запись удалена без файлов.")
+            self.log(
+                f"[Ошибка] Небезопасный путь сборки: {path!r}, "
+                f"запись удалена без файлов."
+            )
         elif os.path.exists(path):
             try:
                 shutil.rmtree(path, ignore_errors=False)
@@ -7779,10 +7842,8 @@ class DotLauncher(QMainWindow):
                     f"Не удалось удалить файлы сборки:\n{e}\n\n"
                     f"Запись сохранена, чтобы не потерять данные."
                 )
-
         if not deletion_ok:
             return
-
         del self.instances[self.current_instance]
         self.current_instance = None
         self.save_instances()
@@ -7802,17 +7863,14 @@ class DotLauncher(QMainWindow):
                 "Сначала выберите сборку в списке слева."
             )
             return
-
         inst = self.instances[self.current_instance]
         path = self._instance_abs_path(inst)
-
         if not os.path.isdir(path):
             QMessageBox.warning(
                 self, "Папка не найдена",
                 f"Папка сборки не существует:\n{path}"
             )
             return
-
         try:
             if sys.platform.startswith("win"):
                 os.startfile(path)
@@ -7821,10 +7879,7 @@ class DotLauncher(QMainWindow):
             else:
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
-            QMessageBox.warning(
-                self, "Ошибка",
-                f"Не удалось открыть папку:\n{e}"
-            )
+            QMessageBox.warning(self, "Ошибка", f"Не удалось открыть папку:\n{e}")
 
     def open_screenshots_folder(self, instance_id=None):
         iid = instance_id or self.current_instance
@@ -7834,13 +7889,9 @@ class DotLauncher(QMainWindow):
                 "Сначала выберите сборку в списке слева."
             )
             return
-
         inst = self.instances[iid]
         instance_dir = self._instance_abs_path(inst)
-        screenshots_dir = os.path.join(
-            instance_dir, ".minecraft", "screenshots"
-        )
-
+        screenshots_dir = os.path.join(instance_dir, ".minecraft", "screenshots")
         if not os.path.isdir(screenshots_dir):
             reply = QMessageBox.question(
                 self, "Папка не найдена",
@@ -7854,11 +7905,9 @@ class DotLauncher(QMainWindow):
                 os.makedirs(screenshots_dir, exist_ok=True)
             except Exception as e:
                 QMessageBox.warning(
-                    self, "Ошибка",
-                    f"Не удалось создать папку:\n{e}"
+                    self, "Ошибка", f"Не удалось создать папку:\n{e}"
                 )
                 return
-
         try:
             if sys.platform.startswith("win"):
                 os.startfile(screenshots_dir)
@@ -7867,12 +7916,8 @@ class DotLauncher(QMainWindow):
             else:
                 subprocess.Popen(["xdg-open", screenshots_dir])
         except Exception as e:
-            QMessageBox.warning(
-                self, "Ошибка",
-                f"Не удалось открыть папку:\n{e}"
-            )
+            QMessageBox.warning(self, "Ошибка", f"Не удалось открыть папку:\n{e}")
 
-    # ---------- MODRINTH ----------
     def open_modrinth_window(self):
         if not self.current_instance:
             QMessageBox.information(
@@ -7889,42 +7934,31 @@ class DotLauncher(QMainWindow):
         if self.export_thread and self.export_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Идёт экспорт.")
             return
-
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
         is_vanilla = (inst.get("loader") == VANILLA_LOADER_ID)
-
         window = ModrinthWindow(
-            inst["name"],
-            inst["loader"],
-            inst["version"],
-            instance_dir,
-            parent=self,
-            vanilla=is_vanilla,
+            inst["name"], inst["loader"], inst["version"],
+            instance_dir, parent=self, vanilla=is_vanilla,
         )
         window.exec()
         self.log(f"[dotLauncher] Modrinth: окно закрыто для «{inst['name']}».")
-
         if getattr(window, "downloaded_mods", False):
             if self.current_instance in self.instances:
                 self.instances[self.current_instance]["modsVerIdentified"] = False
                 self.save_instances()
                 self._ensure_manifest_for_current_instance()
-
         if self.mods_expanded:
             self._populate_mods_list()
 
-    # ---------- ЗАПУСК ИГРЫ ----------
     def play_game(self):
         if not self.current_instance:
             return
         if self.launcher_thread and self.launcher_thread.isRunning():
             return
-
         inst = self.instances[self.current_instance]
         loader_id = inst["loader"]
         loader_version = inst.get("loader_version")
-
         acc = self._active_account()
         if not acc:
             self.log("[Ошибка] Нет активного профиля. Добавьте профиль.")
@@ -7942,7 +7976,6 @@ class DotLauncher(QMainWindow):
             if acc.get("refresh_token"):
                 self.log("[dotLauncher] Обновление сессии Ely.by перед запуском...")
                 self._refresh_active_elyby_blocking()
-
             username = acc.get("username", "")
             uuid_val = acc.get("uuid", "")
             token = acc.get("access_token", "")
@@ -7954,8 +7987,6 @@ class DotLauncher(QMainWindow):
         memory = safe_int(self.config.get("memory_mb"), DEFAULT_MEMORY_MB)
         instance_dir = self._instance_abs_path(inst)
         minecraft_dir = os.path.join(instance_dir, ".minecraft")
-
-        # --- Разрешение Java для конкретного инстанса ---
         java_path, java_major, java_source, required_major = (
             self._resolve_java_for_instance(inst, minecraft_dir)
         )
@@ -7984,7 +8015,6 @@ class DotLauncher(QMainWindow):
                 QMessageBox.critical(self, "Java не найдена", msg)
                 self.log("[Ошибка] Java не найдена для сборки.")
                 return
-
             if (required_major is not None and java_major is not None
                     and java_major < required_major):
                 QMessageBox.critical(
@@ -8001,7 +8031,6 @@ class DotLauncher(QMainWindow):
                     f"для Minecraft {inst['version']}."
                 )
                 return
-
             if (required_major is not None and java_major is not None
                     and java_major > required_major):
                 self.log(
@@ -8009,7 +8038,6 @@ class DotLauncher(QMainWindow):
                     f"({required_major}) для Minecraft {inst['version']}. "
                     f"Возможны проблемы совместимости."
                 )
-
             source_label = {
                 "instance": "Java инстанса",
                 "global": "Глобальная Java",
@@ -8065,7 +8093,6 @@ class DotLauncher(QMainWindow):
         self.progress_bar.setVisible(False)
         self.status_bar.showMessage("Готов" if success else f"Ошибка: {message}")
 
-    # ---------- КОНСОЛЬ ----------
     def log(self, text):
         cursor = self.console.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
@@ -8078,8 +8105,12 @@ class DotLauncher(QMainWindow):
         except Exception:
             pass
 
-    # ---------- ЗАКРЫТИЕ ----------
     def closeEvent(self, event):
+        try:
+            ThemeManager.get().remove_listener(self._on_theme_changed)
+        except Exception:
+            pass
+
         if self.import_thread and self.import_thread.isRunning():
             self.import_thread.cancel()
             if not self.import_thread.wait(5000):
@@ -8094,7 +8125,6 @@ class DotLauncher(QMainWindow):
                 self.mrpack_import_thread.terminate()
                 self.mrpack_import_thread.wait(2000)
 
-        # НОВОЕ: корректное завершение потока .dotpack
         if self.dotpack_import_thread and self.dotpack_import_thread.isRunning():
             self.dotpack_import_thread.cancel()
             if not self.dotpack_import_thread.wait(5000):
@@ -8149,7 +8179,6 @@ class DotLauncher(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-
             self.launcher_thread.stop()
             if not self.launcher_thread.wait(5000):
                 self.log("[Внимание] Поток лаунчера не завершился, принудительное завершение.")
@@ -8177,7 +8206,14 @@ def main():
     app.setOrganizationName(APP_NAME)
     app.setStyle("Fusion")
     app.setFont(QFont("Tahoma", 8))
-    app.setStyleSheet(build_win98_qss())
+
+    tm = ThemeManager.get()
+    tm.load_from_disk(get_config_dir())
+    tm.apply(app)
+
+    global _combo_theme_filter
+    _combo_theme_filter = _ComboThemeFilter()
+    app.installEventFilter(_combo_theme_filter)
 
     app.setWindowIcon(load_app_icon())
 
