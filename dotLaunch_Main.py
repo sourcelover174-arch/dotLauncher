@@ -3,7 +3,7 @@
 """
 dotLauncher — минималистичный лаунчер Minecraft для Fabric/Forge/NeoForge сборок.
 Один файл, PyQt6 + minecraft-launcher-lib. Поддержка Modrinth, .mrpack,
-экспорт в .zip и .dotpack.
+экспорт и импорт .zip и .dotpack.
 Стилизация: Windows 98.
 """
 
@@ -2664,6 +2664,345 @@ class MrpackImportThread(QThread):
 
 
 # ============================================================
+#  ПОТОК: ИМПОРТ .dotpack (НОВОЕ)
+# ============================================================
+class DotpackImportThread(QThread):
+    """
+    Импорт собственного формата .dotpack.
+
+    Читает манифесты (dotpack.json, instance.json, mods.json),
+    извлекает ВСЁ содержимое архива в .minecraft новой сборки
+    (моды, отключённые моды, config, resourcepacks, shaderpacks,
+    defaultconfigs, kubejs, scripts, saves, screenshots, servers.dat,
+    options.txt), восстанавливает индекс модов в .dotlauncher/mods.json,
+    регистрирует инстанс.
+    """
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
+    ask_signal = pyqtSignal(dict)
+    finished_signal = pyqtSignal(bool, dict, str)
+
+    # Файлы в корне архива, которые являются манифестами, а не контентом
+    SPECIAL_ROOT_FILES = ("dotpack.json", "instance.json", "mods.json")
+
+    def __init__(self, dotpack_path, instances_dir, workspace, existing_ids):
+        super().__init__()
+        self.dotpack_path = dotpack_path
+        self.instances_dir = instances_dir
+        self.workspace = workspace
+        self.existing_ids = set(existing_ids)
+        self._event = threading.Event()
+        self._chosen_name = None
+        self._cancelled = False
+        self._progress_max = 0
+        self.instance_id = None
+        self.instance_dir = None
+
+    def set_user_choice(self, name):
+        self._chosen_name = name
+        self._event.set()
+
+    def cancel(self):
+        self._cancelled = True
+        self._event.set()
+
+    def _new_instance_id(self):
+        while True:
+            iid = str(uuid.uuid4())[:8]
+            if iid in self.existing_ids:
+                continue
+            if os.path.exists(os.path.join(self.instances_dir, iid)):
+                continue
+            return iid
+
+    @staticmethod
+    def _is_safe_member(name):
+        """Защита от Zip Slip: запрещаем абсолютные пути и '..'."""
+        if not name:
+            return False
+        if name.startswith("/") or name.startswith("\\"):
+            return False
+        # Windows-диск (C:)
+        if len(name) >= 2 and name[1] == ":":
+            return False
+        parts = re.split(r"[\\/]", name)
+        if ".." in parts:
+            return False
+        return True
+
+    def _cleanup_failed(self):
+        if self.instance_dir and os.path.isdir(self.instance_dir):
+            try:
+                shutil.rmtree(self.instance_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            if not os.path.isfile(self.dotpack_path):
+                self.finished_signal.emit(
+                    False, {}, f"Файл не найден: {self.dotpack_path}"
+                )
+                return
+
+            self.log_signal.emit(
+                f"[dotLauncher] Чтение .dotpack: "
+                f"{os.path.basename(self.dotpack_path)}"
+            )
+
+            # ---------- 1. Читаем манифесты ----------
+            try:
+                with zipfile.ZipFile(self.dotpack_path, "r") as zf:
+                    names = set(zf.namelist())
+
+                    if "dotpack.json" not in names:
+                        self.finished_signal.emit(
+                            False, {},
+                            "Некорректный .dotpack: отсутствует dotpack.json"
+                        )
+                        return
+
+                    try:
+                        with zf.open("dotpack.json") as f:
+                            dotpack_data = json.loads(
+                                f.read().decode("utf-8", errors="replace")
+                            )
+                    except Exception as e:
+                        self.finished_signal.emit(
+                            False, {}, f"Не удалось прочитать dotpack.json: {e}"
+                        )
+                        return
+
+                    if (not isinstance(dotpack_data, dict)
+                            or dotpack_data.get("format") != DOTPACK_FORMAT):
+                        self.finished_signal.emit(
+                            False, {},
+                            "Файл не является .dotpack-архивом dotLauncher."
+                        )
+                        return
+
+                    # instance.json
+                    instance_data = {}
+                    if "instance.json" in names:
+                        try:
+                            with zf.open("instance.json") as f:
+                                data = json.loads(
+                                    f.read().decode("utf-8", errors="replace")
+                                )
+                            if isinstance(data, dict):
+                                instance_data = data
+                        except Exception as e:
+                            self.log_signal.emit(
+                                f"[Внимание] instance.json не прочитан: {e}"
+                            )
+
+                    # mods.json (манифест)
+                    manifest_data = None
+                    if "mods.json" in names:
+                        try:
+                            with zf.open("mods.json") as f:
+                                data = json.loads(
+                                    f.read().decode("utf-8", errors="replace")
+                                )
+                            if isinstance(data, dict):
+                                manifest_data = data
+                        except Exception as e:
+                            self.log_signal.emit(
+                                f"[Внимание] mods.json не прочитан: {e}"
+                            )
+
+                    members = list(zf.infolist())
+            except zipfile.BadZipFile as e:
+                self.finished_signal.emit(
+                    False, {}, f"Повреждённый zip-файл: {e}"
+                )
+                return
+
+            # ---------- 2. Данные из instance.json ----------
+            mc_version = instance_data.get("version") or ""
+            if not mc_version or not isinstance(mc_version, str):
+                self.finished_signal.emit(
+                    False, {},
+                    "В instance.json не указана версия Minecraft."
+                )
+                return
+
+            loader_id = instance_data.get("loader") or VANILLA_LOADER_ID
+            if not isinstance(loader_id, str) or loader_id not in MOD_LOADERS:
+                loader_id = VANILLA_LOADER_ID
+
+            loader_version = instance_data.get("loader_version")
+            if not isinstance(loader_version, str) or not loader_version:
+                loader_version = None
+
+            default_name = instance_data.get("name") or "Imported Dotpack"
+            if not isinstance(default_name, str) or not default_name.strip():
+                default_name = "Imported Dotpack"
+
+            # ---------- 3. Формируем список контента для извлечения ----------
+            content_members = []
+            jar_mod_count = 0
+            for m in members:
+                if m.is_dir():
+                    continue
+                name = m.filename
+                # Пропускаем корневые манифесты
+                if name in self.SPECIAL_ROOT_FILES:
+                    continue
+                # Защита от Zip Slip
+                if not self._is_safe_member(name):
+                    self.log_signal.emit(
+                        f"[Внимание] Пропущен небезопасный путь: {name!r}"
+                    )
+                    continue
+                content_members.append(m)
+
+                # Считаем jar'ы модов (для проверки полноты манифеста)
+                low = name.lower().replace("\\", "/")
+                if low.endswith(".jar") and (
+                    low.startswith("mods/") or low.startswith("disabledmods/")
+                ):
+                    jar_mod_count += 1
+
+            manifest_count = 0
+            if isinstance(manifest_data, dict):
+                m_mods = manifest_data.get("mods")
+                if isinstance(m_mods, dict):
+                    manifest_count = len(m_mods)
+
+            # Если в манифесте записей не меньше, чем jar'ов — считаем,
+            # что индексировать заново не нужно.
+            mods_identified = (
+                manifest_data is not None
+                and manifest_count >= jar_mod_count
+            )
+
+            loader_display = MOD_LOADERS.get(loader_id, loader_id)
+            self.log_signal.emit(
+                f"[dotLauncher] Пак: {default_name} | "
+                f"MC {mc_version} | {loader_display} "
+                f"{loader_version or ''}".rstrip()
+            )
+            self.log_signal.emit(
+                f"[dotLauncher] Файлов к извлечению: {len(content_members)}, "
+                f"модов в манифесте: {manifest_count}, jar'ов: {jar_mod_count}."
+            )
+
+            # ---------- 4. Спрашиваем имя сборки ----------
+            self.ask_signal.emit({
+                "default_name": default_name,
+                "mc_version": mc_version,
+                "loader_display": loader_display,
+                "loader_version": loader_version or "",
+                "files_count": len(content_members),
+                "mods_count": jar_mod_count,
+                "has_manifest": manifest_data is not None,
+            })
+            self._event.wait()
+            self._event.clear()
+
+            if self._cancelled or not self._chosen_name:
+                self.finished_signal.emit(False, {}, "Отменено пользователем")
+                return
+
+            name = sanitize_instance_name(self._chosen_name)
+
+            # ---------- 5. Готовим папку будущей сборки ----------
+            self.instance_id = self._new_instance_id()
+            self.instance_dir = os.path.join(
+                self.instances_dir, self.instance_id
+            )
+            minecraft_dir = os.path.join(self.instance_dir, ".minecraft")
+            os.makedirs(minecraft_dir, exist_ok=True)
+
+            # ---------- 6. Извлекаем всё содержимое ----------
+            total = len(content_members)
+            self.progress_signal.emit(0, total)
+            extracted = 0
+
+            try:
+                with zipfile.ZipFile(self.dotpack_path, "r") as zf:
+                    for i, m in enumerate(content_members):
+                        if self._cancelled:
+                            raise Exception("Отменено пользователем")
+                        try:
+                            zf.extract(m, minecraft_dir)
+                            extracted += 1
+                        except Exception as e:
+                            self.log_signal.emit(
+                                f"[Внимание] Не удалось извлечь "
+                                f"{m.filename}: {e}"
+                            )
+                        # Обновляем прогресс не слишком часто
+                        if i % 20 == 0 or i == total - 1:
+                            self.progress_signal.emit(i + 1, total)
+            except Exception as e:
+                self._cleanup_failed()
+                self.finished_signal.emit(
+                    False, {}, f"Ошибка извлечения: {e}"
+                )
+                return
+
+            if self._cancelled:
+                self._cleanup_failed()
+                self.finished_signal.emit(False, {}, "Отменено пользователем")
+                return
+
+            self.log_signal.emit(
+                f"[dotLauncher] Извлечено {extracted} из {total} файлов."
+            )
+
+            # ---------- 7. Сохраняем индекс модов в .dotlauncher/mods.json ----------
+            if manifest_data is not None:
+                manifest_dir = os.path.join(
+                    self.instance_dir, MANIFEST_DIR_NAME
+                )
+                try:
+                    os.makedirs(manifest_dir, exist_ok=True)
+                    manifest_path = os.path.join(
+                        manifest_dir, MANIFEST_FILE_NAME
+                    )
+                    with open(manifest_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            manifest_data, f,
+                            ensure_ascii=False, indent=2
+                        )
+                    self.log_signal.emit(
+                        "[dotLauncher] Индекс модов восстановлен."
+                    )
+                except Exception as e:
+                    self.log_signal.emit(
+                        f"[Внимание] Не удалось сохранить индекс модов: {e}"
+                    )
+
+            # ---------- 8. Регистрируем сборку ----------
+            path_rel = os.path.relpath(self.instance_dir, self.workspace)
+            info = {
+                "instance_id": self.instance_id,
+                "name": name,
+                "version": mc_version,
+                "loader": loader_id,
+                "loader_version": loader_version,
+                "path_rel": path_rel,
+                "modsVerIdentified": bool(mods_identified),
+            }
+
+            self.log_signal.emit(
+                f"[dotLauncher] Сборка «{name}» импортирована из .dotpack."
+            )
+            self.finished_signal.emit(True, info, "")
+
+        except Exception as e:
+            self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
+            try:
+                self.log_signal.emit(traceback.format_exc())
+            except Exception:
+                pass
+            self._cleanup_failed()
+            self.finished_signal.emit(False, {}, str(e))
+
+
+# ============================================================
 #  ПОТОК: ЭКСПОРТ СБОРКИ (.zip / .dotpack)
 # ============================================================
 class InstanceExportThread(QThread):
@@ -4763,6 +5102,105 @@ class MrpackConfirmDialog(QDialog):
 
 
 # ============================================================
+#  ОКНО: ПОДТВЕРЖДЕНИЕ ИМПОРТА .dotpack (НОВОЕ)
+# ============================================================
+class DotpackConfirmDialog(QDialog):
+    """
+    Диалог подтверждения импорта .dotpack.
+    Показывает информацию о паке и поле ввода имени сборки.
+    """
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info if isinstance(info, dict) else {}
+        self.result_data = None
+
+        self.setWindowTitle("Импорт сборки (.dotpack)")
+        self.setMinimumSize(540, 380)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        header = QLabel("Импорт .dotpack")
+        header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        info_text = (
+            f"Minecraft: {self.info.get('mc_version', '?')}   |   "
+            f"Загрузчик: {self.info.get('loader_display', '?')}"
+        )
+        lv = self.info.get("loader_version") or ""
+        if lv:
+            info_text += f" {lv}"
+        version_label = QLabel(info_text)
+        version_label.setStyleSheet("color: #404040;")
+        layout.addWidget(version_label)
+
+        files_count = self.info.get("files_count", 0)
+        mods_count = self.info.get("mods_count", 0)
+        files_label = QLabel(
+            f"Файлов в архиве: {files_count}  |  Модов: {mods_count}"
+        )
+        layout.addWidget(files_label)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+
+        if self.info.get("has_manifest"):
+            note_text = (
+                "Индекс модов включён в архив — реиндексация не потребуется.\n"
+                "Все моды, конфиги, миры, скриншоты и прочие файлы будут "
+                "восстановлены."
+            )
+        else:
+            note_text = (
+                "Индекс модов отсутствует — потребуется автоматическая "
+                "реиндексация модов при первом открытии сборки."
+            )
+        note = QLabel(note_text)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        layout.addSpacing(4)
+        layout.addWidget(QLabel("Название сборки:"))
+        self.name_input = QLineEdit()
+        default_name = self.info.get("default_name") or "Imported Dotpack"
+        self.name_input.setText(default_name)
+        self.name_input.selectAll()
+        layout.addWidget(self.name_input)
+
+        layout.addStretch()
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedHeight(26)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("Импортировать")
+        ok_btn.setFixedHeight(26)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.on_ok)
+        btns.addWidget(ok_btn)
+
+        layout.addLayout(btns)
+
+    def on_ok(self):
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Ошибка", "Введите название сборки.")
+            return
+        self.result_data = {"name": name}
+        self.accept()
+
+
+# ============================================================
 #  ОКНО: ЭКСПОРТ СБОРКИ
 # ============================================================
 class ExportInstanceDialog(QDialog):
@@ -5424,6 +5862,8 @@ class DotLauncher(QMainWindow):
         self.refresh_thread = None
         self.import_thread = None
         self.mrpack_import_thread = None
+        # НОВОЕ: поток импорта .dotpack
+        self.dotpack_import_thread = None
         self.instance_install_thread = None
         self.manifest_rebuild_thread = None
         self.export_thread = None
@@ -5583,10 +6023,11 @@ class DotLauncher(QMainWindow):
         center_layout.addWidget(self.title_label)
 
         self.drop_zone = DropZone(self)
+        # ОБНОВЛЕНО: упоминаем .dotpack
         self.drop_zone.setText(
             "Перетащи сюда .jar файлы модов, папку модпака,\n"
-            ".zip-архив или .mrpack — чтобы создать сборку\n\n"
-            "Поддерживаются Fabric, Forge и NeoForge, а также .mrpack Modrinth"
+            ".zip-архив, .mrpack или .dotpack — чтобы создать сборку\n\n"
+            "Поддерживаются Fabric, Forge и NeoForge, а также .mrpack и .dotpack"
         )
         self.drop_zone.filesDropped.connect(self.handle_dropped_files)
         center_layout.addWidget(self.drop_zone, 1)
@@ -6182,10 +6623,13 @@ class DotLauncher(QMainWindow):
 
     # ---------- DRAG-AND-DROP / ИМПОРТ ----------
     def _any_import_running(self):
+        # ОБНОВЛЕНО: теперь учитываем и dotpack
         return (
             (self.import_thread is not None and self.import_thread.isRunning())
             or (self.mrpack_import_thread is not None
                 and self.mrpack_import_thread.isRunning())
+            or (self.dotpack_import_thread is not None
+                and self.dotpack_import_thread.isRunning())
         )
 
     def handle_dropped_files(self, files):
@@ -6202,16 +6646,23 @@ class DotLauncher(QMainWindow):
             self.log("[Ошибка] Идёт экспорт. Дождитесь завершения.")
             return
 
+        # ОБНОВЛЕНО: классифицируем .mrpack, .dotpack и прочее
         mrpack_files = []
+        dotpack_files = []
         other_files = []
         for f in files:
-            if os.path.isfile(f) and f.lower().endswith(".mrpack"):
-                mrpack_files.append(f)
-            else:
-                other_files.append(f)
+            if os.path.isfile(f):
+                low = f.lower()
+                if low.endswith(".mrpack"):
+                    mrpack_files.append(f)
+                    continue
+                if low.endswith(".dotpack"):
+                    dotpack_files.append(f)
+                    continue
+            other_files.append(f)
 
+        # Приоритет: .mrpack > .dotpack > обычный импорт.
         if mrpack_files:
-            # Обрабатываем только первый .mrpack; остальные — с предупреждением
             if len(mrpack_files) > 1:
                 self.log(
                     f"[Внимание] Обнаружено {len(mrpack_files)} .mrpack. "
@@ -6220,10 +6671,26 @@ class DotLauncher(QMainWindow):
                 for extra in mrpack_files[1:]:
                     self.log(f"[dotLauncher] Пропущен: {os.path.basename(extra)}")
             self._start_mrpack_import(mrpack_files[0])
-            if other_files:
+            if dotpack_files or other_files:
                 self.log(
                     "[Внимание] Остальные файлы из drop проигнорированы — "
                     "сначала завершите импорт .mrpack."
+                )
+            return
+
+        if dotpack_files:
+            if len(dotpack_files) > 1:
+                self.log(
+                    f"[Внимание] Обнаружено {len(dotpack_files)} .dotpack. "
+                    f"Обрабатывается только первый."
+                )
+                for extra in dotpack_files[1:]:
+                    self.log(f"[dotLauncher] Пропущен: {os.path.basename(extra)}")
+            self._start_dotpack_import(dotpack_files[0])
+            if other_files:
+                self.log(
+                    "[Внимание] Остальные файлы из drop проигнорированы — "
+                    "сначала завершите импорт .dotpack."
                 )
             return
 
@@ -6238,7 +6705,7 @@ class DotLauncher(QMainWindow):
                     relevant.append(f)
 
         if not relevant:
-            self.log("[Ошибка] Нет .jar, .zip, .mrpack или папок для обработки.")
+            self.log("[Ошибка] Нет .jar, .zip, .mrpack, .dotpack или папок для обработки.")
             return
 
         self.play_button.setEnabled(False)
@@ -6256,11 +6723,12 @@ class DotLauncher(QMainWindow):
         self.import_thread.start()
 
     def import_modpack_dialog(self):
+        # ОБНОВЛЕНО: добавили .dotpack в фильтр
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Выберите модпак, архив или моды для импорта",
             "",
-            "Модпаки и моды (*.zip *.jar);;Все файлы (*)",
+            "Модпаки и моды (*.zip *.jar *.dotpack);;Все файлы (*)",
         )
         if not files:
             return
@@ -6298,6 +6766,31 @@ class DotLauncher(QMainWindow):
             return
         self._start_mrpack_import(path)
 
+    # НОВОЕ: диалог импорта .dotpack
+    def import_dotpack_dialog(self):
+        if self._any_import_running():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения текущего импорта.")
+            return
+        if self.launcher_thread and self.launcher_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
+            return
+        if self.instance_install_thread and self.instance_install_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт создание новой сборки.")
+            return
+        if self.export_thread and self.export_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт экспорт.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите сборку .dotpack",
+            "",
+            "dotLauncher Pack (*.dotpack);;Все файлы (*)",
+        )
+        if not path:
+            return
+        self._start_dotpack_import(path)
+
     def _start_mrpack_import(self, mrpack_path):
         if not MRPACK_AVAILABLE:
             QMessageBox.warning(
@@ -6324,6 +6817,26 @@ class DotLauncher(QMainWindow):
         self.mrpack_import_thread.finished_signal.connect(self.on_mrpack_finished)
         self.mrpack_import_thread.start()
 
+    # НОВОЕ: запуск импорта .dotpack
+    def _start_dotpack_import(self, dotpack_path):
+        self.play_button.setEnabled(False)
+        self.new_instance_button.setEnabled(False)
+        self.status_bar.showMessage("Импорт .dotpack...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+        self.dotpack_import_thread = DotpackImportThread(
+            dotpack_path,
+            self.config["instances_dir"],
+            self.config["workspace"],
+            self.instances.keys(),
+        )
+        self.dotpack_import_thread.log_signal.connect(self.log)
+        self.dotpack_import_thread.progress_signal.connect(self.update_progress)
+        self.dotpack_import_thread.ask_signal.connect(self.on_dotpack_ask)
+        self.dotpack_import_thread.finished_signal.connect(self.on_dotpack_finished)
+        self.dotpack_import_thread.start()
+
     def on_mrpack_ask(self, info):
         thread = self.mrpack_import_thread
         if thread is None:
@@ -6343,6 +6856,24 @@ class DotLauncher(QMainWindow):
             dlg.result_data.get("name", ""),
             dlg.result_data.get("optionals", []),
         )
+
+    # НОВОЕ: обработка вопроса от .dotpack-потока
+    def on_dotpack_ask(self, info):
+        thread = self.dotpack_import_thread
+        if thread is None:
+            return
+
+        self.progress_bar.setVisible(False)
+
+        dlg = DotpackConfirmDialog(info, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            thread.cancel()
+            return
+        if not dlg.result_data:
+            thread.cancel()
+            return
+
+        thread.set_user_choice(dlg.result_data.get("name", ""))
 
     def on_mrpack_finished(self, success, info, error):
         self.play_button.setEnabled(True)
@@ -6375,6 +6906,49 @@ class DotLauncher(QMainWindow):
         self.save_instances()
         self.refresh_instance_list()
         self.log(f"[dotLauncher] Сборка «{info.get('name')}» добавлена из .mrpack.")
+
+    # НОВОЕ: завершение импорта .dotpack
+    def on_dotpack_finished(self, success, info, error):
+        self.play_button.setEnabled(True)
+        self.new_instance_button.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage("Готов")
+
+        if not success:
+            if error:
+                self.log(f"[dotLauncher] Импорт .dotpack не завершён: {error}")
+            return
+
+        if not isinstance(info, dict):
+            self.log("[Ошибка] Импорт .dotpack вернул некорректные данные.")
+            return
+
+        iid = info.get("instance_id")
+        if not iid:
+            self.log("[Ошибка] Импорт .dotpack: нет instance_id.")
+            return
+
+        # Переносим флаг modsVerIdentified, если поток его указал
+        mods_identified = bool(info.get("modsVerIdentified", False))
+
+        self.instances[iid] = {
+            "name": info.get("name", "Imported Dotpack"),
+            "version": info.get("version", ""),
+            "loader": info.get("loader", VANILLA_LOADER_ID),
+            "loader_version": info.get("loader_version"),
+            "path_rel": info.get("path_rel", os.path.join("instances", iid)),
+            "modsVerIdentified": mods_identified,
+        }
+        self.save_instances()
+        self.refresh_instance_list()
+        self.log(
+            f"[dotLauncher] Сборка «{info.get('name')}» добавлена из .dotpack."
+        )
+
+        # Если манифеста не было — просим переиндексировать
+        if not mods_identified:
+            self._select_instance_by_id(iid)
+            self._ensure_manifest_for_current_instance()
 
     def on_import_ask(self, versions, loaders):
         thread = self.import_thread
@@ -6689,6 +7263,9 @@ class DotLauncher(QMainWindow):
                 act_import_mrpack.setToolTip(
                     "Требуется minecraft-launcher-lib с модулем mrpack."
                 )
+            # НОВОЕ: пункт меню для импорта .dotpack
+            act_import_dotpack = menu.addAction("Импорт .dotpack...")
+
             chosen = menu.exec(self.instance_list.mapToGlobal(pos))
             if chosen is None:
                 return
@@ -6698,6 +7275,8 @@ class DotLauncher(QMainWindow):
                 self.import_modpack_dialog()
             elif chosen == act_import_mrpack:
                 self.import_mrpack_dialog()
+            elif chosen == act_import_dotpack:
+                self.import_dotpack_dialog()
             return
 
         instance_id = item.data(Qt.ItemDataRole.UserRole)
@@ -7514,6 +8093,14 @@ class DotLauncher(QMainWindow):
                 self.log("[Внимание] Поток импорта .mrpack не завершился, принудительное завершение.")
                 self.mrpack_import_thread.terminate()
                 self.mrpack_import_thread.wait(2000)
+
+        # НОВОЕ: корректное завершение потока .dotpack
+        if self.dotpack_import_thread and self.dotpack_import_thread.isRunning():
+            self.dotpack_import_thread.cancel()
+            if not self.dotpack_import_thread.wait(5000):
+                self.log("[Внимание] Поток импорта .dotpack не завершился, принудительное завершение.")
+                self.dotpack_import_thread.terminate()
+                self.dotpack_import_thread.wait(2000)
 
         if self.instance_install_thread and self.instance_install_thread.isRunning():
             self.instance_install_thread.stop()
