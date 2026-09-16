@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 dotLauncher — минималистичный лаунчер Minecraft для Fabric/Forge/NeoForge сборок.
-Один файл, PyQt6 + minecraft-launcher-lib. Поддержка Modrinth и .mrpack.
+Один файл, PyQt6 + minecraft-launcher-lib. Поддержка Modrinth, .mrpack,
+экспорт в .zip и .dotpack.
 Стилизация: Windows 98.
 """
 
@@ -21,6 +22,7 @@ import logging
 import traceback
 import socket
 import base64
+import datetime
 import xml.etree.ElementTree as ET
 
 _orig_getaddrinfo = socket.getaddrinfo
@@ -116,6 +118,12 @@ MRPACK_UNSUPPORTED_KEYS = {
     "liteloader": "LiteLoader",
     "legacy-fabric": "Legacy Fabric",
 }
+
+# Формат собственного экспорта
+DOTPACK_FORMAT = "dotpack"
+DOTPACK_FORMAT_VERSION = 1
+ZIP_FORMAT = "dotlauncher-zip"
+ZIP_FORMAT_VERSION = 1
 
 MODRINTH_API = "https://api.modrinth.com/v2"
 MODRINTH_USER_AGENT = f"{APP_NAME}/{LAUNCHER_VERSION} (dotLauncher)"
@@ -789,6 +797,16 @@ def sha1_file(path):
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest().lower()
+
+
+def utc_now_iso():
+    """ISO-8601 UTC с 'Z'."""
+    try:
+        return datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except Exception:
+        return datetime.datetime.utcnow().isoformat() + "Z"
 
 
 def format_mod_version_label(vdata):
@@ -2584,6 +2602,7 @@ class MrpackImportThread(QThread):
             callback = self._make_callback()
 
             # 4. Строим mrpack_install_options для выбранных опциональных
+            # Параметр ожидает dict: {path_из_манифеста: True|False}
             install_options = {}
             if optional_files:
                 selected_set = set(selected_optionals)
@@ -2642,6 +2661,319 @@ class MrpackImportThread(QThread):
                 pass
             self._cleanup_failed()
             self.finished_signal.emit(False, {}, str(e))
+
+
+# ============================================================
+#  ПОТОК: ЭКСПОРТ СБОРКИ (.zip / .dotpack)
+# ============================================================
+class InstanceExportThread(QThread):
+    """
+    Экспорт сборки в .zip (универсальный) или .dotpack (собственный).
+    Ничего не блокирует, всё делает в фоне.
+    """
+    log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, inst, instance_dir, config, output_path, options):
+        super().__init__()
+        self.inst = inst if isinstance(inst, dict) else {}
+        self.instance_dir = instance_dir
+        self.minecraft_dir = os.path.join(instance_dir, ".minecraft")
+        self.config = config if isinstance(config, dict) else {}
+        self.output_path = output_path
+        self.options = options if isinstance(options, dict) else {}
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    # ---------- сбор файлов ----------
+    def _collect_files(self):
+        """Возвращает список (abs_path, arcname)."""
+        files = []
+        mc_dir = self.minecraft_dir
+        fmt = self.options.get("format", DOTPACK_FORMAT)
+        fat = self.options.get("fat", True)
+        include_mods = self.options.get("include_mods", True) and fat
+
+        # --- Моды (активные) ---
+        if include_mods:
+            mods_dir = os.path.join(mc_dir, "mods")
+            if os.path.isdir(mods_dir):
+                try:
+                    for fn in sorted(os.listdir(mods_dir)):
+                        if fn.lower().endswith(".jar"):
+                            p = os.path.join(mods_dir, fn)
+                            if os.path.isfile(p):
+                                files.append((p, f"mods/{fn}"))
+                except OSError:
+                    pass
+
+            # Выключенные моды — только в .dotpack
+            if fmt == DOTPACK_FORMAT:
+                ddir = os.path.join(mc_dir, "disabledMods")
+                if os.path.isdir(ddir):
+                    try:
+                        for fn in sorted(os.listdir(ddir)):
+                            if fn.lower().endswith(".jar"):
+                                p = os.path.join(ddir, fn)
+                                if os.path.isfile(p):
+                                    files.append((p, f"disabledMods/{fn}"))
+                    except OSError:
+                        pass
+
+        # --- Обычные папки с конфигами ---
+        dir_flags = (
+            ("config", "include_config"),
+            ("resourcepacks", "include_resourcepacks"),
+            ("shaderpacks", "include_shaderpacks"),
+            ("defaultconfigs", "include_defaultconfigs"),
+            ("kubejs", "include_kubejs"),
+            ("scripts", "include_scripts"),
+        )
+        for dir_name, opt_key in dir_flags:
+            if not self.options.get(opt_key, False):
+                continue
+            src = os.path.join(mc_dir, dir_name)
+            if not os.path.isdir(src):
+                continue
+            for root, _dirs, fls in os.walk(src):
+                for fn in fls:
+                    full = os.path.join(root, fn)
+                    rel = os.path.relpath(full, mc_dir).replace(os.sep, "/")
+                    files.append((full, rel))
+
+        # --- Миры ---
+        if self.options.get("include_saves"):
+            src = os.path.join(mc_dir, "saves")
+            if os.path.isdir(src):
+                for root, _dirs, fls in os.walk(src):
+                    for fn in fls:
+                        full = os.path.join(root, fn)
+                        rel = os.path.relpath(full, mc_dir).replace(os.sep, "/")
+                        files.append((full, rel))
+
+        # --- Скриншоты ---
+        if self.options.get("include_screenshots"):
+            src = os.path.join(mc_dir, "screenshots")
+            if os.path.isdir(src):
+                try:
+                    for fn in sorted(os.listdir(src)):
+                        p = os.path.join(src, fn)
+                        if os.path.isfile(p):
+                            files.append((p, f"screenshots/{fn}"))
+                except OSError:
+                    pass
+
+        # --- servers.dat ---
+        if self.options.get("include_servers"):
+            p = os.path.join(mc_dir, "servers.dat")
+            if os.path.isfile(p):
+                files.append((p, "servers.dat"))
+
+        # --- options.txt ---
+        if self.options.get("include_options"):
+            p = os.path.join(mc_dir, "options.txt")
+            if os.path.isfile(p):
+                files.append((p, "options.txt"))
+
+        return files
+
+    # ---------- манифесты ----------
+    def _build_dotpack_json(self):
+        return {
+            "format": DOTPACK_FORMAT,
+            "format_version": DOTPACK_FORMAT_VERSION,
+            "launcher": APP_NAME,
+            "launcher_version": LAUNCHER_VERSION,
+            "created_at": utc_now_iso(),
+            "fat": bool(self.options.get("fat", True)),
+            "name": self.inst.get("name", ""),
+        }
+
+    def _build_instance_json(self):
+        required_java = get_required_java_major(
+            self.minecraft_dir, self.inst.get("version")
+        )
+        memory = safe_int(self.config.get("memory_mb"), DEFAULT_MEMORY_MB)
+        data = {
+            "name": self.inst.get("name", ""),
+            "version": self.inst.get("version", ""),
+            "loader": self.inst.get("loader", VANILLA_LOADER_ID),
+            "loader_version": self.inst.get("loader_version"),
+            "memory_mb": memory,
+            "java_major": required_java,
+            "modsVerIdentified": True,
+        }
+        return data
+
+    def _build_zip_manifest(self):
+        return {
+            "format": ZIP_FORMAT,
+            "format_version": ZIP_FORMAT_VERSION,
+            "launcher": APP_NAME,
+            "launcher_version": LAUNCHER_VERSION,
+            "created_at": utc_now_iso(),
+            "name": self.inst.get("name", ""),
+            "version": self.inst.get("version", ""),
+            "loader": self.inst.get("loader", VANILLA_LOADER_ID),
+            "loader_version": self.inst.get("loader_version"),
+        }
+
+    def _build_readme(self):
+        return (
+            f"dotLauncher modpack\n"
+            f"====================\n"
+            f"\n"
+            f"Name:           {self.inst.get('name', '?')}\n"
+            f"Minecraft:      {self.inst.get('version', '?')}\n"
+            f"Loader:         {self.inst.get('loader', '?')}\n"
+            f"Loader version: {self.inst.get('loader_version') or 'auto'}\n"
+            f"Created:        {utc_now_iso()}\n"
+            f"\n"
+            f"Это универсальный экспорт сборки.\n"
+            f"Скопируйте содержимое `mods/`, `config/` и других папок в\n"
+            f"соответствующие папки своего Minecraft.\n"
+            f"\n"
+            f"Для точного восстановления (с сохранением индекса модов,\n"
+            f"версий загрузчика и настроек) используйте формат .dotpack.\n"
+        )
+
+    # ---------- run ----------
+    def run(self):
+        try:
+            fmt = self.options.get("format", DOTPACK_FORMAT)
+
+            self.log_signal.emit("[dotLauncher] Сканирование сборки...")
+            files = self._collect_files()
+
+            # +1 на манифест в начале архива
+            total = len(files) + 1
+            self.log_signal.emit(
+                f"[dotLauncher] Найдено {len(files)} файл(ов) для упаковки."
+            )
+            self.progress_signal.emit(0, total)
+
+            parent_dir = os.path.dirname(self.output_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            tmp_path = self.output_path + ".tmp"
+
+            try:
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    # 1. Манифесты
+                    if fmt == DOTPACK_FORMAT:
+                        # dotpack.json
+                        zf.writestr(
+                            "dotpack.json",
+                            json.dumps(
+                                self._build_dotpack_json(),
+                                ensure_ascii=False, indent=2
+                            ),
+                        )
+                        # instance.json
+                        zf.writestr(
+                            "instance.json",
+                            json.dumps(
+                                self._build_instance_json(),
+                                ensure_ascii=False, indent=2
+                            ),
+                        )
+                        # mods.json
+                        manifest_path = get_manifest_path(self.instance_dir)
+                        if os.path.isfile(manifest_path):
+                            try:
+                                with open(manifest_path, "rb") as f:
+                                    zf.writestr("mods.json", f.read())
+                            except Exception as e:
+                                self.log_signal.emit(
+                                    f"[Внимание] Не удалось прочитать mods.json: {e}"
+                                )
+                                zf.writestr(
+                                    "mods.json",
+                                    json.dumps(
+                                        _empty_manifest(),
+                                        ensure_ascii=False, indent=2
+                                    ),
+                                )
+                        else:
+                            self.log_signal.emit(
+                                "[Внимание] Манифест модов ещё не построен — "
+                                "будет создан пустой. При импорте потребуется "
+                                "повторная индексация."
+                            )
+                            zf.writestr(
+                                "mods.json",
+                                json.dumps(
+                                    _empty_manifest(),
+                                    ensure_ascii=False, indent=2
+                                ),
+                            )
+                    else:
+                        # .zip
+                        zf.writestr(
+                            "manifest.json",
+                            json.dumps(
+                                self._build_zip_manifest(),
+                                ensure_ascii=False, indent=2
+                            ),
+                        )
+                        zf.writestr("README.txt", self._build_readme())
+
+                    self.progress_signal.emit(1, total)
+
+                    # 2. Содержимое
+                    for i, (abs_path, arcname) in enumerate(files, start=1):
+                        if self._stop:
+                            raise Exception("Отменено пользователем")
+                        try:
+                            zf.write(abs_path, arcname)
+                        except Exception as e:
+                            self.log_signal.emit(
+                                f"[Внимание] Не удалось добавить {arcname}: {e}"
+                            )
+                        self.progress_signal.emit(i + 1, total)
+
+                # Атомарная замена
+                if os.path.exists(self.output_path):
+                    try:
+                        os.remove(self.output_path)
+                    except OSError:
+                        pass
+                os.replace(tmp_path, self.output_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+            try:
+                size_mb = os.path.getsize(self.output_path) / (1024 * 1024)
+                size_str = f"{size_mb:.1f} МБ"
+            except Exception:
+                size_str = "?"
+
+            self.log_signal.emit(
+                f"[dotLauncher] Экспорт завершён: {self.output_path} "
+                f"({size_str})"
+            )
+            self.finished_signal.emit(True, "")
+        except Exception as e:
+            self.log_signal.emit(f"[Ошибка] {type(e).__name__}: {e}")
+            try:
+                self.log_signal.emit(traceback.format_exc())
+            except Exception:
+                pass
+            # чистим временный файл, если остался
+            try:
+                tmp_path = self.output_path + ".tmp"
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            self.finished_signal.emit(False, str(e))
 
 
 # ============================================================
@@ -4431,6 +4763,180 @@ class MrpackConfirmDialog(QDialog):
 
 
 # ============================================================
+#  ОКНО: ЭКСПОРТ СБОРКИ
+# ============================================================
+class ExportInstanceDialog(QDialog):
+    """
+    Диалог экспорта сборки. Формат .zip (универсальный) или .dotpack
+    (собственный формат dotLauncher).
+    """
+    def __init__(self, inst, has_mods_manifest, parent=None):
+        super().__init__(parent)
+        self.inst = inst if isinstance(inst, dict) else {}
+        self.has_mods_manifest = bool(has_mods_manifest)
+        self.result_data = None
+
+        self.setWindowTitle(f"Экспорт сборки «{self.inst.get('name', '')}»")
+        self.setMinimumSize(600, 620)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+
+        header = QLabel("Экспорт сборки")
+        header.setFont(QFont("Tahoma", 11, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        name_label = QLabel(f"Сборка: {self.inst.get('name', '?')}")
+        name_label.setWordWrap(True)
+        layout.addWidget(name_label)
+
+        info_text = (
+            f"Minecraft: {self.inst.get('version', '?')}   |   "
+            f"Загрузчик: {MOD_LOADERS.get(self.inst.get('loader', ''), self.inst.get('loader', '?'))}"
+        )
+        lv = self.inst.get("loader_version") or ""
+        if lv:
+            info_text += f" {lv}"
+        version_label = QLabel(info_text)
+        version_label.setStyleSheet("color: #404040;")
+        layout.addWidget(version_label)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(line)
+
+        # Формат
+        layout.addWidget(QLabel("Формат экспорта:"))
+        self.rb_dotpack = QRadioButton(
+            ".dotpack — собственный формат dotLauncher"
+        )
+        self.rb_dotpack.setToolTip(
+            "Сохраняет индексацию модов (mods.json), версии загрузчика,\n"
+            "состояние «выключен/включён», параметры Java.\n"
+            "Импорт быстрый, без реиндексации."
+        )
+        self.rb_dotpack.setChecked(True)
+        layout.addWidget(self.rb_dotpack)
+
+        self.rb_zip = QRadioButton(
+            ".zip — универсальный архив"
+        )
+        self.rb_zip.setToolTip(
+            "Открывается любым лаунчером и человеком вручную.\n"
+            "При импорте в dotLauncher моды будут переиндексированы."
+        )
+        layout.addWidget(self.rb_zip)
+
+        # Состояние манифеста
+        if not self.has_mods_manifest:
+            warn = QLabel(
+                "⚠  Моды ещё не проиндексированы. При экспорте в .dotpack "
+                "индекс будет пустым — потребуется повторная индексация "
+                "при импорте."
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #800000;")
+            layout.addWidget(warn)
+
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.Shape.HLine)
+        line2.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(line2)
+
+        # Что включить
+        layout.addWidget(QLabel("Что включить в архив:"))
+
+        self.cb_mods = QCheckBox("Моды (mods/)")
+        self.cb_mods.setChecked(True)
+        self.cb_config = QCheckBox("config/")
+        self.cb_config.setChecked(True)
+        self.cb_resourcepacks = QCheckBox("resourcepacks/")
+        self.cb_resourcepacks.setChecked(True)
+        self.cb_shaderpacks = QCheckBox("shaderpacks/")
+        self.cb_shaderpacks.setChecked(True)
+        self.cb_defaultconfigs = QCheckBox("defaultconfigs/")
+        self.cb_defaultconfigs.setChecked(True)
+        self.cb_kubejs = QCheckBox("kubejs/")
+        self.cb_kubejs.setChecked(True)
+        self.cb_scripts = QCheckBox("scripts/")
+        self.cb_scripts.setChecked(True)
+        self.cb_saves = QCheckBox("Миры (saves/) — личные данные")
+        self.cb_screenshots = QCheckBox("Скриншоты")
+        self.cb_servers = QCheckBox("Список серверов (servers.dat)")
+        self.cb_options = QCheckBox("Настройки игры (options.txt)")
+
+        for cb in (self.cb_mods, self.cb_config, self.cb_resourcepacks,
+                   self.cb_shaderpacks, self.cb_defaultconfigs,
+                   self.cb_kubejs, self.cb_scripts, self.cb_saves,
+                   self.cb_screenshots, self.cb_servers, self.cb_options):
+            layout.addWidget(cb)
+
+        layout.addStretch()
+
+        # Кнопки
+        btns = QHBoxLayout()
+        btns.addStretch()
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedHeight(26)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+
+        ok_btn = QPushButton("Сохранить...")
+        ok_btn.setFixedHeight(26)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.on_ok)
+        btns.addWidget(ok_btn)
+
+        layout.addLayout(btns)
+
+    def on_ok(self):
+        fmt = DOTPACK_FORMAT if self.rb_dotpack.isChecked() else "zip"
+
+        # Проверяем, что выбрано хоть что-то
+        any_selected = any((
+            self.cb_mods.isChecked(),
+            self.cb_config.isChecked(),
+            self.cb_resourcepacks.isChecked(),
+            self.cb_shaderpacks.isChecked(),
+            self.cb_defaultconfigs.isChecked(),
+            self.cb_kubejs.isChecked(),
+            self.cb_scripts.isChecked(),
+            self.cb_saves.isChecked(),
+            self.cb_screenshots.isChecked(),
+            self.cb_servers.isChecked(),
+            self.cb_options.isChecked(),
+        ))
+        if not any_selected:
+            QMessageBox.warning(
+                self, "Ничего не выбрано",
+                "Отметьте хотя бы один пункт для экспорта."
+            )
+            return
+
+        self.result_data = {
+            "format": fmt,
+            "fat": True,  # всегда с содержимым; thin пока не поддерживаем
+            "include_mods": self.cb_mods.isChecked(),
+            "include_config": self.cb_config.isChecked(),
+            "include_resourcepacks": self.cb_resourcepacks.isChecked(),
+            "include_shaderpacks": self.cb_shaderpacks.isChecked(),
+            "include_defaultconfigs": self.cb_defaultconfigs.isChecked(),
+            "include_kubejs": self.cb_kubejs.isChecked(),
+            "include_scripts": self.cb_scripts.isChecked(),
+            "include_saves": self.cb_saves.isChecked(),
+            "include_screenshots": self.cb_screenshots.isChecked(),
+            "include_servers": self.cb_servers.isChecked(),
+            "include_options": self.cb_options.isChecked(),
+        }
+        self.accept()
+
+
+# ============================================================
 #  ОКНО: СОЗДАНИЕ СБОРКИ
 # ============================================================
 class NewInstanceDialog(QDialog):
@@ -4920,6 +5426,7 @@ class DotLauncher(QMainWindow):
         self.mrpack_import_thread = None
         self.instance_install_thread = None
         self.manifest_rebuild_thread = None
+        self.export_thread = None
         self.mods_expanded = False
 
         self.config_dir = get_config_dir()
@@ -5691,6 +6198,9 @@ class DotLauncher(QMainWindow):
         if self.instance_install_thread and self.instance_install_thread.isRunning():
             self.log("[Ошибка] Идёт создание новой сборки. Дождитесь завершения.")
             return
+        if self.export_thread and self.export_thread.isRunning():
+            self.log("[Ошибка] Идёт экспорт. Дождитесь завершения.")
+            return
 
         mrpack_files = []
         other_files = []
@@ -5773,6 +6283,9 @@ class DotLauncher(QMainWindow):
             return
         if self.instance_install_thread and self.instance_install_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Идёт создание новой сборки.")
+            return
+        if self.export_thread and self.export_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт экспорт.")
             return
 
         path, _ = QFileDialog.getOpenFileName(
@@ -5934,6 +6447,114 @@ class DotLauncher(QMainWindow):
         self.refresh_instance_list()
         self.log(f"[dotLauncher] Сборка «{info['name']}» добавлена.")
 
+    # ---------- ЭКСПОРТ СБОРКИ ----------
+    def export_instance(self, instance_id):
+        if instance_id not in self.instances:
+            return
+        if self._any_import_running():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения импорта.")
+            return
+        if self.launcher_thread and self.launcher_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения запуска.")
+            return
+        if self.instance_install_thread and self.instance_install_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт создание новой сборки.")
+            return
+        if self.export_thread and self.export_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Экспорт уже выполняется.")
+            return
+
+        inst = self.instances[instance_id]
+        if inst.get("installing"):
+            QMessageBox.warning(
+                self, "Подождите",
+                "Сборка ещё создаётся. Дождитесь завершения."
+            )
+            return
+
+        instance_dir = self._instance_abs_path(inst)
+        if not os.path.isdir(instance_dir):
+            QMessageBox.warning(
+                self, "Папка не найдена",
+                f"Папка сборки не существует:\n{instance_dir}"
+            )
+            return
+
+        has_manifest = os.path.isfile(get_manifest_path(instance_dir))
+
+        dlg = ExportInstanceDialog(inst, has_manifest, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dlg.result_data:
+            return
+
+        options = dlg.result_data
+        fmt = options.get("format", DOTPACK_FORMAT)
+
+        safe_name = sanitize_instance_name(inst.get("name", "instance"))
+        if fmt == DOTPACK_FORMAT:
+            default_filename = f"{safe_name}.dotpack"
+            file_filter = "dotLauncher Modpack (*.dotpack);;Все файлы (*)"
+        else:
+            default_filename = f"{safe_name}.zip"
+            file_filter = "ZIP archive (*.zip);;Все файлы (*)"
+
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить сборку как", default_filename, file_filter
+        )
+        if not output_path:
+            return
+
+        # Дополняем расширение, если пользователь его не указал
+        low = output_path.lower()
+        if fmt == DOTPACK_FORMAT and not low.endswith(".dotpack"):
+            output_path += ".dotpack"
+        elif fmt == "zip" and not low.endswith(".zip"):
+            output_path += ".zip"
+
+        if os.path.exists(output_path):
+            reply = QMessageBox.question(
+                self, "Файл существует",
+                f"Файл уже существует:\n{output_path}\n\nПерезаписать?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        self._start_instance_export(inst, instance_dir, output_path, options)
+
+    def _start_instance_export(self, inst, instance_dir, output_path, options):
+        self.play_button.setEnabled(False)
+        self.new_instance_button.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_bar.showMessage("Экспорт сборки...")
+        self.log(
+            f"[dotLauncher] Экспорт сборки «{inst['name']}» → {output_path}"
+        )
+
+        self.export_thread = InstanceExportThread(
+            inst, instance_dir, self.config, output_path, options
+        )
+        self.export_thread.log_signal.connect(self.log)
+        self.export_thread.progress_signal.connect(self.update_progress)
+        self.export_thread.finished_signal.connect(self.on_export_finished)
+        self.export_thread.start()
+
+    def on_export_finished(self, success, error):
+        self.play_button.setEnabled(True)
+        self.new_instance_button.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_bar.showMessage("Готов")
+        if success:
+            QMessageBox.information(self, "Готово", "Экспорт завершён.")
+        else:
+            self.log(f"[dotLauncher] Экспорт не завершён: {error}")
+            QMessageBox.warning(
+                self, "Ошибка",
+                f"Экспорт не удался:\n{error}"
+            )
+
     # ---------- НОВАЯ СБОРКА ----------
     def open_new_instance_dialog(self):
         if self._any_import_running():
@@ -5944,6 +6565,9 @@ class DotLauncher(QMainWindow):
             return
         if self.instance_install_thread and self.instance_install_thread.isRunning():
             QMessageBox.warning(self, "Занято", "Идёт создание новой сборки.")
+            return
+        if self.export_thread and self.export_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт экспорт.")
             return
 
         dlg = NewInstanceDialog(parent=self)
@@ -6091,6 +6715,10 @@ class DotLauncher(QMainWindow):
             self.launcher_thread is not None
             and self.launcher_thread.isRunning()
         )
+        export_running = (
+            self.export_thread is not None
+            and self.export_thread.isRunning()
+        )
 
         act_play = menu.addAction("Играть")
         act_play.setEnabled(not launcher_running)
@@ -6101,6 +6729,9 @@ class DotLauncher(QMainWindow):
             act_expand = menu.addAction("Развернуть сборку")
 
         act_java = menu.addAction("Настройки Java...")
+
+        act_export = menu.addAction("Экспортировать сборку...")
+        act_export.setEnabled(not export_running)
 
         act_folder = menu.addAction("Открыть папку сборки")
         act_screenshots = menu.addAction("Открыть скриншоты")
@@ -6114,7 +6745,7 @@ class DotLauncher(QMainWindow):
         if chosen is None:
             return
 
-        if chosen in (act_play, act_expand, act_folder):
+        if chosen in (act_play, act_expand, act_folder, act_export):
             self._select_instance_by_id(instance_id)
 
         if chosen == act_play:
@@ -6123,6 +6754,8 @@ class DotLauncher(QMainWindow):
             self.toggle_expand()
         elif chosen == act_java:
             self._open_instance_java_settings(instance_id)
+        elif chosen == act_export:
+            self.export_instance(instance_id)
         elif chosen == act_folder:
             self.open_instance_folder()
         elif chosen == act_screenshots:
@@ -6674,6 +7307,9 @@ class DotLauncher(QMainWindow):
         if self._any_import_running():
             QMessageBox.warning(self, "Занято", "Дождитесь завершения импорта.")
             return
+        if self.export_thread and self.export_thread.isRunning():
+            QMessageBox.warning(self, "Занято", "Идёт экспорт.")
+            return
 
         inst = self.instances[self.current_instance]
         instance_dir = self._instance_abs_path(inst)
@@ -6892,6 +7528,21 @@ class DotLauncher(QMainWindow):
                 self.log("[Внимание] Поток индексации модов не завершился, принудительное завершение.")
                 self.manifest_rebuild_thread.terminate()
                 self.manifest_rebuild_thread.wait(1000)
+
+        if self.export_thread and self.export_thread.isRunning():
+            reply = QMessageBox.question(
+                self, "Экспорт в процессе",
+                "Экспорт сборки ещё не завершён. Прервать и выйти?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.export_thread.stop()
+            if not self.export_thread.wait(5000):
+                self.log("[Внимание] Поток экспорта не завершился, принудительное завершение.")
+                self.export_thread.terminate()
+                self.export_thread.wait(2000)
 
         if self.launcher_thread and self.launcher_thread.isRunning():
             if self.launcher_thread.process is None:
