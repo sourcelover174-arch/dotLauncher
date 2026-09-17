@@ -6330,6 +6330,7 @@ class DotLauncher(QMainWindow):
         main_layout.addWidget(splitter)
 
         self.status_bar = self.statusBar()
+        self.status_bar.setSizeGripEnabled(False)
         self.status_bar.showMessage("Готов")
 
     def _validate_config(self, cfg):
